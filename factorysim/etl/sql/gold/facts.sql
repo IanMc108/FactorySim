@@ -13,14 +13,26 @@ GROUP BY ALL
 ORDER BY ALL;
 
 -- table: fct_sales_daily
+-- Net billing per day. A credit memo counts on the date of the invoice it reverses, so a
+-- duplicate invoice and its later reversal cancel out on the day the duplicate was billed
+-- (an unreversed duplicate stays visible there until the credit memo arrives).
+WITH lines AS (
+    SELECT l.*,
+           coalesce(
+               CASE WHEN l.doc_type = 'CM' THEN (
+                   SELECT min(i.business_date) FROM silver_invoice_lines i
+                   WHERE i.doc_no = l.reference_doc AND i.doc_type = 'INV') END,
+               l.business_date) AS billing_date
+    FROM silver_invoice_lines l
+)
 SELECT
-    business_date,
+    billing_date AS business_date,
     sku,
     coalesce(sum(qty) FILTER (WHERE doc_type = 'INV'), 0)::BIGINT AS invoiced_units,
     coalesce(-sum(qty) FILTER (WHERE doc_type = 'CM'), 0)::BIGINT AS credited_units,
     sum(qty)::BIGINT AS net_units,
     sum(line_amount)::DECIMAL(18, 2) AS net_revenue
-FROM silver_invoice_lines
+FROM lines
 GROUP BY ALL
 ORDER BY ALL;
 
@@ -48,6 +60,8 @@ ORDER BY work_order;
 -- table: fct_bank_transactions
 SELECT
     row_number() OVER (ORDER BY txn_date, _file, _record_number) AS line_seq,
+    -- stable across runs, unlike line_seq: the statement file and line it came from
+    regexp_extract(_file, '[^/]+$') || '#' || _record_number AS source_line,
     txn_date, txn_kind, reference, description,
     amount::DECIMAL(18, 2) AS amount, balance::DECIMAL(18, 2) AS balance
 FROM silver_bank_transactions

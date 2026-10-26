@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -299,8 +300,8 @@ class _Exporter:
         next_day = production.get(day + 1)
         extra: list[Record] = []
         for rec in list(records):
-            if rec.defects:
-                continue  # keep one defect per record so scoring stays unambiguous
+            if any(d["defect"] != "code_variant" for d in rec.defects):
+                continue  # one data defect per record; a code variant can combine with it
             if self.chance(self.rates.duplicate_row):
                 copy = Record(dict(rec.data), [{"defect": "duplicate_row"}])
                 target = next_day if next_day is not None and self.chance(0.5) else extra
@@ -326,6 +327,8 @@ class _Exporter:
 
     def build_invoices(self) -> None:
         doc_seq = 0
+        by_day: dict[int, list[Record]] = defaultdict(list)
+        last_sales_day = max(self.truth.sales)
         for day in sorted(self.truth.sales):
             bdate = business_date(day)
             lines = self.truth.sales[day]
@@ -337,7 +340,7 @@ class _Exporter:
                 pid: self.rng.multinomial(units, [1 / n_customers] * n_customers)
                 for pid, units, _ in lines
             }
-            records: list[Record] = []
+            records = by_day[day]
             for i, customer in enumerate(customers):
                 doc_lines = [
                     (pid, int(split[pid][i]), price) for pid, _, price in lines if split[pid][i]
@@ -375,6 +378,8 @@ class _Exporter:
                     dup_no = f"INV-25-{doc_seq:06d}"
                     doc_seq += 1
                     cm_no = f"CM-25-{doc_seq:06d}"
+                    # The duplicate is reversed by a credit memo issued 0-10 days later.
+                    cm_day = min(day + int(self.rng.integers(0, 11)), last_sales_day)
                     for r in doc_records:
                         records.append(
                             Record(
@@ -382,7 +387,7 @@ class _Exporter:
                                 [{"defect": "reversed_invoice", "role": "duplicate"}],
                             )
                         )
-                        records.append(
+                        by_day[cm_day].append(
                             Record(
                                 dict(
                                     r.data,
@@ -390,12 +395,22 @@ class _Exporter:
                                     doc_type="CM",
                                     ref_doc=dup_no,
                                     qty=-r.data["qty"],
+                                    doc_date=business_date(cm_day),
                                 ),
-                                [{"defect": "reversed_invoice", "role": "credit_memo"}],
+                                [
+                                    {
+                                        "defect": "reversed_invoice",
+                                        "role": "credit_memo",
+                                        "days_later": cm_day - day,
+                                    }
+                                ],
                             )
                         )
+        for day in sorted(by_day):
+            bdate = business_date(day)
+            records = by_day[day]
             for rec in list(records):
-                if rec.defects:
+                if any(d["defect"] != "code_variant" for d in rec.defects):
                     continue
                 if self.chance(self.rates.double_keyed_line):
                     same_doc = [r for r in records if r.data["doc_no"] == rec.data["doc_no"]]
@@ -882,10 +897,18 @@ def export_sources(
     manifest: list[dict] = list(dropped)
     written = records = 0
 
+    landed_per_day: dict[date, int] = defaultdict(int)
+
     def write(f: SourceFile, payload: bytes, arrival: date) -> str:
         path = landing / f.source / f"{arrival:%Y/%m/%d}" / f.name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
+        # Deterministic landing times: 06:00 UTC on the arrival day, one second apart in
+        # the order the files are written (the pipeline orders same-day files by them).
+        landed_per_day[arrival] += 1
+        stamp = datetime.combine(arrival, time(6), timezone.utc).timestamp()
+        ns = int(stamp + landed_per_day[arrival]) * 10**9
+        os.utime(path, ns=(ns, ns))
         return path.relative_to(landing).as_posix()
 
     payloads = {}

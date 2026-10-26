@@ -1,20 +1,13 @@
 -- Reconciliation checks. Each is
---   -- check: <name> | key=<quarantine key or any> | effect=<feed>:<effect>, ...
+--   -- check: <name> | sources=<feeds> | key=<station|sku|material|reference|any>
 -- followed by one SELECT returning (business_date, window_start, key, expected, actual).
--- The pipeline wraps every check with the same variance and status logic (pipeline.py).
---
--- The header says which quarantined records may account for a variance: open (not yet
--- released) records from the listed feeds, dated in the row's window, whose recovered key
--- (station, sku, material or reference) matches the row's key or could not be recovered.
--- <effect> is how losing one such record moves the variance (actual - expected):
---   +units / -amount ...  a recoverable size with a sign
---   +? / -?               only the direction is known
---   ?                     neither
--- A variance is "explained" only if it equals the effect of the matching records exactly.
--- If some matching record's size is unknown and its direction fits, the row "needs review";
--- otherwise it is an exception.
+-- The pipeline wraps every check the same way (pipeline.py): a row is matched when the
+-- variance is 0, open when it is within the late-arrival window, and otherwise an
+-- exception. Nothing is cleared automatically. Open quarantined records from the listed
+-- feeds, dated in the row's window, whose recovered key matches the row's key (or could
+-- not be recovered) are attached to the row as evidence for whoever triages it.
 
--- check: mass_balance | key=station | effect=mes_production:-?, mes_material_issues:+units
+-- check: mass_balance | sources=mes_production,mes_material_issues | key=station
 -- Every unit of material issued to a station comes out as exactly one graded unit.
 SELECT
     coalesce(i.business_date, p.business_date) AS business_date,
@@ -28,7 +21,7 @@ FULL OUTER JOIN (SELECT business_date, station_code, sum(units) AS units
                  FROM fct_production_daily GROUP BY ALL) p
     USING (business_date, station_code);
 
--- check: production_vs_sales | key=sku | effect=mes_production:+units_recovered, erp_invoices:-units
+-- check: production_vs_sales | sources=mes_production,erp_invoices | key=sku
 -- Good output is sold on the day it is made.
 SELECT
     coalesce(p.business_date, s.business_date) AS business_date,
@@ -41,7 +34,7 @@ FROM (SELECT f.business_date, f.sku, sum(f.units) AS units
       WHERE r.sellable GROUP BY ALL) p
 FULL OUTER JOIN fct_sales_daily s USING (business_date, sku);
 
--- check: customer_receipts | key=any | effect=erp_invoices:+amount, bank_statements:-deposit
+-- check: customer_receipts | sources=erp_invoices,bank_statements | key=any
 -- Each day's net invoiced revenue is deposited the same day.
 SELECT
     coalesce(s.business_date, b.txn_date) AS business_date,
@@ -54,7 +47,7 @@ FULL OUTER JOIN (SELECT txn_date, sum(amount) AS amount FROM fct_bank_transactio
                  WHERE txn_kind = 'customer_receipts' GROUP BY ALL) b
     ON b.txn_date = s.business_date;
 
--- check: supplier_payments | key=reference | effect=erp_goods_receipts:+?, bank_statements:-payment
+-- check: supplier_payments | sources=erp_goods_receipts,bank_statements | key=reference
 -- Each PO's receipts (possibly several partial deliveries) are paid in full between the
 -- first delivery and the payment terms after the last. Payments for unknown POs,
 -- or outside the terms window, are reported as their own rows so they cannot hide.
@@ -84,7 +77,7 @@ UNION ALL
 SELECT txn_date, NULL::DATE, po_no || ' (payment outside terms or without receipt)', 0, paid
 FROM classified WHERE NOT on_terms;
 
--- check: maintenance_payments | key=reference | effect=cmms_work_orders:+?, bank_statements:-payment
+-- check: maintenance_payments | sources=cmms_work_orders,bank_statements | key=reference
 -- Each completed work order is paid within the payment terms of its completion day.
 WITH orders AS (
     SELECT work_order, business_date, cost FROM fct_maintenance WHERE business_date IS NOT NULL
@@ -109,7 +102,7 @@ SELECT txn_date, NULL::DATE, work_order || ' (payment outside terms or without w
        paid
 FROM classified WHERE NOT on_terms;
 
--- check: inventory_roll_forward | key=material | effect=erp_stock_snapshots:?, erp_goods_receipts:+?, mes_material_issues:-?
+-- check: inventory_roll_forward | sources=erp_stock_snapshots,erp_goods_receipts,mes_material_issues | key=material
 -- Snapshot = previous snapshot + receipts - issues in between.
 WITH snaps AS (
     SELECT *, lag(snapshot_date) OVER w AS prev_date, lag(on_hand) OVER w AS prev_on_hand
@@ -132,19 +125,29 @@ SELECT
 FROM snaps s
 WHERE s.prev_date IS NOT NULL;
 
--- check: bank_balance_continuity | key=any | effect=bank_statements:?
+-- check: bank_balance_continuity | sources=bank_statements | key=any
 -- Line by line, each statement balance equals the previous balance plus the line amount.
+-- A BALANCE FORWARD line after the first must carry the previous balance forward.
 WITH lines AS (
     SELECT *, lag(balance) OVER (ORDER BY line_seq) AS prev_balance
     FROM fct_bank_transactions
 )
 SELECT txn_date AS business_date, NULL::DATE AS window_start,
-       'line ' || line_seq || ': ' || description AS key,
+       source_line || ': ' || description AS key,
        prev_balance + amount AS expected, balance AS actual
 FROM lines
-WHERE txn_kind <> 'opening_balance';
+WHERE prev_balance IS NOT NULL;
 
--- check: credit_memo_references | key=reference | effect=erp_invoices:-?
+-- check: unreferenced_bank_lines | sources=bank_statements | key=any
+-- Every bank line must be a customer deposit or reference a PO or work order (whose
+-- amounts the payment checks reconcile). Anything else is cash nobody can account for.
+SELECT txn_date AS business_date, NULL::DATE AS window_start,
+       source_line || ': ' || description AS key,
+       0 AS expected, amount AS actual
+FROM fct_bank_transactions
+WHERE txn_kind = 'unclassified';
+
+-- check: credit_memo_references | sources=erp_invoices | key=reference
 -- Every credit memo reverses an invoice that exists.
 SELECT cm.business_date, NULL::DATE AS window_start, cm.reference_doc AS key,
        1 AS expected,
@@ -152,3 +155,11 @@ SELECT cm.business_date, NULL::DATE AS window_start, cm.reference_doc AS key,
         WHERE i.doc_no = cm.reference_doc AND i.doc_type = 'INV') AS actual
 FROM (SELECT DISTINCT doc_no, reference_doc, min(business_date) AS business_date
       FROM silver_invoice_lines WHERE doc_type = 'CM' GROUP BY ALL) cm;
+
+-- check: file_version_shrink | sources=erp_invoices,erp_goods_receipts,erp_stock_snapshots,mes_production,mes_material_issues,bank_statements,cmms_work_orders | key=any
+-- A re-issued file with fewer records than an earlier version withdraws data. That can be
+-- deliberate, but a person has to confirm it (a 0-record re-issue empties the file).
+SELECT file_business_date AS business_date, NULL::DATE AS window_start, file_name AS key,
+       greatest(max_earlier_records, current_records) AS expected, current_records AS actual
+FROM file_versions
+WHERE versions > 1;

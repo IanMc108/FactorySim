@@ -13,7 +13,8 @@ WITH parsed AS (
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _arrival_ts, _ingest_seq,
+    _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN issue_id IS NULL THEN 'missing_key'
@@ -22,7 +23,7 @@ SELECT
             THEN local_time_problem(issue_ts_local)
         WHEN qty IS NULL THEN 'invalid_quantity'
         WHEN qty <= 0 THEN 'non_positive_quantity'
-        WHEN shift NOT IN ('A', 'B', 'C') THEN 'invalid_shift'
+        WHEN shift IS NULL OR shift NOT IN ('A', 'B', 'C') THEN 'invalid_shift'
         WHEN uom IS DISTINCT FROM 'EA' THEN 'unsupported_uom'
         WHEN s.station_code IS NULL THEN 'unknown_station'
         WHEN m.material_code IS NULL THEN 'unknown_material'

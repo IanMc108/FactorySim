@@ -273,9 +273,11 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
 
     # ------------------------------------------------------------------ reconciliation
     recon = lake.rows(
-        f"SELECT check_name, business_date, key, status FROM {lake.gold('recon_results')}"
+        "SELECT check_name, business_date, key, status, candidate_records "
+        f"FROM {lake.gold('recon_results')}"
     )
-    status = {(c, d, k): s for c, d, k, s in recon}
+    status = {(c, d, k): s for c, d, k, s, _ in recon}
+    evidence = {(c, d, k): n for c, d, k, _, n in recon}
     exceptions = {(c, d, k) for (c, d, k), s in status.items() if s == "exception"}
     sellable = {sku for _, sku in truth_sales_units}
     stations = sorted(set(STATION_CODES.values()))
@@ -308,28 +310,47 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
             }
         raise ValueError(e["defect"])
 
+    def loss_rows(e: dict) -> set[tuple]:
+        """The reconciliation rows an injected lost (quarantined) record must show up in."""
+        if e["source"] == "mes_production":
+            d = day(e["record_business_date"])
+            rows = {("mass_balance", d, e["record_true_station"])}
+            if e["record_true_sku"] in sellable:
+                rows.add(("production_vs_sales", d, e["record_true_sku"]))
+            return rows
+        d = day(e["record_doc_date"])
+        return {("production_vs_sales", d, e["record_true_sku"]), ("customer_receipts", d, "ALL")}
+
     business_errors = [e for name in BUSINESS_ERRORS for e in by_defect[name]]
-    expected_x = (
-        set().union(*(expected_rows(e) for e in business_errors)) if business_errors else set()
-    )
-    # A business error is caught only if it surfaces: as an exception, as a row a person has
-    # to review, or still open inside the late-arrival window. "Explained by quarantine"
-    # would hide it, and counts as missed.
-    surfaced_statuses = ("exception", "needs_review", "open_late_window")
-    flagged = {k for k in expected_x if status.get(k) in surfaced_statuses}
-    masked = {k for k in expected_x if status.get(k) == "explained_by_quarantine"}
+    expected_x = set().union(*(expected_rows(e) for e in business_errors))
+    lossy = [e for name in LOSSY_DEFECTS for e in by_defect[name]]
+    expected_loss = set().union(*(loss_rows(e) for e in lossy))
+    # Every variance is reported; nothing is cleared automatically. A business error is
+    # caught if its rows are exceptions; "open" means it was too recent to judge at the end
+    # of the run, and is reported separately rather than counted as caught.
+    caught = {k for k in expected_x if status.get(k) == "exception"}
+    still_open = {k for k in expected_x if status.get(k) == "open_late_window"}
+    loss_flagged = {k for k in expected_loss if status.get(k) in ("exception", "open_late_window")}
     reconciliation = {
         "exceptions": len(exceptions),
         "expected_business_errors": len(expected_x),
-        "business_errors_flagged": len(flagged),
-        "flagged_as_exception": len(expected_x & exceptions),
-        "flagged_for_review": len({k for k in expected_x if status.get(k) == "needs_review"}),
-        "masked_by_quarantine": len(masked),
-        "missed": sorted([list(map(str, k)) for k in expected_x - flagged]),
-        "unexpected_exceptions": sorted([list(map(str, k)) for k in exceptions - expected_x]),
-        "rows_needing_review": sum(s == "needs_review" for s in status.values()),
+        "business_errors_caught": len(caught),
+        "business_errors_open": len(still_open),
+        "business_errors_missed": sorted(
+            [list(map(str, k)) for k in expected_x - caught - still_open]
+        ),
+        # Rows where an analyst sees quarantine evidence next to a genuine business error,
+        # and could wrongly blame the lost record.
+        "business_errors_with_evidence": len({k for k in caught if evidence.get(k)}),
+        "expected_data_loss_rows": len(expected_loss),
+        "data_loss_rows_flagged": len(loss_flagged),
+        "data_loss_rows_with_evidence": len({k for k in loss_flagged if evidence.get(k)}),
+        "unexpected_exceptions": sorted(
+            [list(map(str, k)) for k in exceptions - expected_x - expected_loss]
+        ),
         "status_counts": dict(Counter(status.values())),
     }
+    business_rows = sorted([list(map(str, k)) for k in expected_x])
 
     # ------------------------------------------------------------------ per-defect handling
     ingest_log = {
@@ -382,6 +403,13 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         "bank_statements": ("bank_closing_balance",),
     }
 
+    def loss_surfaced(e: dict) -> bool:
+        """Every reconciliation row the lost record touches is flagged, with evidence."""
+        return all(
+            status.get(k) in ("exception", "open_late_window") and evidence.get(k)
+            for k in loss_rows(e)
+        )
+
     def production_cell_ok(e: dict) -> bool:
         cell = (day(e["record_business_date"]), e["record_true_station"], e["record_true_sku"])
         return verdicts["production_units"].get(cell) in ("exact", "explained")
@@ -398,6 +426,8 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
 
     def code_variant_ok(e: dict) -> bool:
         canonical = e["canonical"]
+        if (e["file"], e["record_number"]) in quarantined:
+            return True  # the record also carried a data defect and was quarantined for it
         if e["source"] == "mes_production":
             row = events.get(e["key_event_id"])
             return bool(row) and canonical in (row[2], row[3])
@@ -464,27 +494,34 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
                 quarantined.get((e["file"], e["record_number"]))
                 == EXPECTED_REASON[("malformed_row", e["mode"])]
                 and (production_cell_ok(e) if e["source"] == "mes_production" else sales_cell_ok(e))
+                and loss_surfaced(e)
             ),
             "quarantined with the right reason; gold differs from the truth by exactly the lost "
-            "record",
+            "record; reconciliation flags it with the record attached",
         ),
         "unknown_code": (
             lambda e: (
                 quarantined.get((e["file"], e["record_number"])) == "unknown_sku"
                 and sales_cell_ok(e)
+                and loss_surfaced(e)
             ),
-            "quarantined as unknown_sku, never guessed; gold differs by exactly the lost line",
+            "quarantined as unknown_sku, never guessed; gold differs by exactly the lost line; "
+            "reconciliation flags it with the record attached",
         ),
         "missing_key": (
             lambda e: (
                 quarantined.get((e["file"], e["record_number"])) == "missing_key"
                 and sales_cell_ok(e)
+                and loss_surfaced(e)
             ),
-            "quarantined as missing_key; gold differs by exactly the lost line",
+            "quarantined as missing_key; gold differs by exactly the lost line; reconciliation "
+            "flags it with the record attached",
         ),
         **{
             name: (
-                lambda e: all(status.get(k) in surfaced_statuses for k in expected_rows(e)),
+                lambda e: all(
+                    status.get(k) in ("exception", "open_late_window") for k in expected_rows(e)
+                ),
                 how,
             )
             for name, how in (
@@ -529,6 +566,7 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
 
     return {
         "manifest_entries": len(manifest),
+        "business_error_rows": business_rows,
         "batches": len({b for _, b, _, _ in batches}),
         "late_files_in_later_batch": late_in_later_batch,
         "defects": defects,

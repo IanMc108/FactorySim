@@ -25,6 +25,7 @@ lake/
   gold/<table>/part-0.parquet                                       full rebuild
   _control/ingest_log/batch_id=NNNNNN/batch.parquet                 one row per file arrival
   _control/run.lock                                                 present while a run is active
+  _orphaned/...                                                     bronze nobody can account for
   catalog.duckdb                                                    views, rebuilt each run
 ```
 
@@ -34,28 +35,32 @@ Bronze is partitioned by **arrival** date, because that is when the pipeline lea
 
 Each `factorysim etl [--through DATE]` run does the following:
 
-1. **Lock and clean up.** Take `_control/run.lock`, or refuse to run. Delete bronze files that have no ingest-log entry (a crash between writing a file and logging it), and treat logged bronze files that have gone missing as never loaded. Bronze is listed once for both.
-2. **Discover** landed files (optionally only those with arrival date ≤ `--through`), in arrival order. Marker files (`_SUCCESS`, dotfiles) are ignored.
+1. **Lock and recover.** Take `_control/run.lock`, or refuse to run. **Bronze is never deleted.** Every bronze file carries its own ingest metadata (feed, file, SHA-256, arrival date and time, sequence, size, modification and change times) in its Parquet footer. A bronze file without a log entry, left by a crash between writing it and logging it or by a lost control table, has its log entry rebuilt from that metadata. A file without readable metadata is moved to `_orphaned/` for a person. A logged bronze file that has gone missing is treated as never loaded, so it is rebuilt from the landing zone. Bronze is listed once for all of this.
+2. **Discover** landed files (optionally only those with arrival date ≤ `--through`), in arrival order: arrival folder, then the file's modification time (its arrival time; on S3, `LastModified`). Marker files (`_SUCCESS`, dotfiles) are ignored.
 3. **Ingest** each arrival and commit it before moving on:
 
    | Case | Outcome |
    |---|---|
-   | Same path, same size and modification time as its last entry | Skipped without reading the file |
+   | Same path, same size, modification time and change time as its last entry | Skipped without reading the file |
    | Same path, same SHA-256 as its last entry | Logged `touched` (new size/mtime, so the next run skips the read) |
    | Content already loaded under this file name | Logged `duplicate_content` and not stored again (a re-delivery, or a revert) |
-   | Name or folder that breaks the convention, or bytes that decode as neither UTF-8 nor Windows-1252 | Logged `rejected` with the error; the batch carries on |
+   | Name or folder that breaks the convention; an arrival before the file's business date or more than 60 days after it; bytes that decode as neither UTF-8 nor Windows-1252; an empty file or a missing header | Logged `rejected` with the error; the batch carries on, and the file does not count towards the latest arrival |
    | Anything else | Split into records and written to bronze with lineage |
+
+   The change time catches a same-size correction copied with its old modification time preserved (`cp -p`, `rsync -t`).
 
    Records that do not split into the header's columns are kept with `_parse_error`; a short row also keeps its leading columns by position. Repeated header lines are dropped. At the end of the batch, its per-file log entries are compacted into one file.
 
-   The **current version** of each file name is then read from the log: the `loaded` or `duplicate_content` entry with the latest arrival date, then the latest sequence. Silver only sees that version's records. This one rule handles in-place overwrites, re-sends, reverts (A→B→A), header-only re-issues that withdraw every record, and versions that land in an earlier arrival folder, identically in incremental and full runs.
+   The **current version** of each file name is then read from the log: the `loaded` or `duplicate_content` entry with the latest arrival date, then the latest sequence. One arrival folder holds one path per file name, so within a folder the latest log entry is what is on disk now, even after an overwrite by a copy with an older modification time. Silver only sees that version's records. This one rule handles in-place overwrites, re-sends, reverts (A→B→A), header-only re-issues that withdraw every record, and versions that land in an earlier arrival folder, identically in incremental and full runs. Records with the same key in *different* files are ordered by arrival folder and then arrival time (step 4), which comes from the files, not from when a run happened to see them: a re-extract that lands in the same folder after a run wins in both. A version with fewer records than an earlier one is raised by the `file_version_shrink` check.
 4. **Silver.** For each entity:
    - keep only the records of each file name's current version;
    - run the entity's SQL to type, conform and validate every record;
-   - send rejected rows to quarantine, and deduplicate valid rows on the natural key, latest first;
+   - send rejected rows to quarantine, and deduplicate valid rows on the natural key, latest first (highest MES revision, then newest extract, then latest arrival folder and time);
    - fingerprint every business month (row count plus a sum of row hashes) on both the new result and the lake; rewrite the months that differ and delete months left empty.
-5. **Gold.** Read silver and quarantine back *from the lake* and rebuild the facts, the reconciliation tables and the DQ summary.
+5. **Gold.** Read silver and quarantine back *from the lake* and rebuild the facts, the reconciliation tables and the DQ summary. Compare the new reconciliation with the previous run's (`recon_changes`): which exceptions are new and which cleared.
 6. **Catalog.** Recreate `catalog.duckdb` with views over every table.
+
+`factorysim etl` prints the rejected files and the new and cleared exceptions, and exits with status 3 if any file was rejected, or 2 with `--fail-on-new-exceptions` if there are new exceptions, so a scheduler can alert on either.
 
 **Why recompute silver from all of bronze?** Deduplication and "latest wins" need every version of a key, and a correction can move a record to another month: the first version of this pipeline only rewrote the months its new records fell in, and left a stale copy behind in the old month. Fingerprinting every month makes the write set exactly the months whose content changed, so there is no "touched months" logic to get wrong. The cost is reading all of bronze on every run (see *Scale and cost*).
 
@@ -93,10 +98,10 @@ Bank statements carry no transaction ID, so the running balance is part of the k
 Every check returns `(business_date, key, expected, actual)`, and one wrapper assigns its status:
 
 1. `matched`: the variance is 0;
-2. `explained_by_quarantine`: the variance is exactly what the related open quarantined records would cause;
-3. `open_late_window`: the date is within 7 days of the latest arrival, so late files may still close the gap;
-4. `needs_review`: a related quarantined record of unknown size could cause it (its direction fits, and the variance is within any bound on its size), or there are too many candidate records to check. A person has to look;
-5. `exception`: none of the above.
+2. `open_late_window`: the date is within 7 days of the latest arrival, so late files may still close the gap;
+3. `exception`: anything else.
+
+**Nothing is cleared automatically.** An earlier version tried to mark variances as "explained by quarantine" when the effect of the related quarantined records added up to the variance. Two rounds of review showed why that is a bad idea: the rules for what counts as related and how big an unparseable record is grew complicated, one quarantined record could "explain" two rows at once, and every mistake in them hid a real error. The pipeline now raises every variance and attaches evidence instead.
 
 | Check | Expected | Actual | Catches |
 |---|---|---|---|
@@ -106,25 +111,20 @@ Every check returns `(business_date, key, expected, actual)`, and one wrapper as
 | `supplier_payments` | goods-receipt value per PO (all partial deliveries) | bank payments for the PO from the first delivery to 3 days after the last | unpaid, double-paid or late-paid receipts, UoM errors; payments outside the window get their own row |
 | `maintenance_payments` | work-order cost | bank payments for the WO within 3 days | duplicate or missing completions, double or late payments |
 | `inventory_roll_forward` | previous snapshot + receipts − issues | snapshot | lost receipts or issues, UoM errors |
-| `bank_balance_continuity` | previous balance + amount, per line | reported balance | missing, duplicated or corrupted statement lines |
+| `bank_balance_continuity` | previous balance + amount, per line, including each `BALANCE FORWARD` | reported balance | missing, duplicated or corrupted statement lines; a statement that does not carry the previous close forward |
+| `unreferenced_bank_lines` | 0 | the amount of a line that is neither a deposit nor references a PO or work order | cash nobody can account for (a fraudulent or misdirected debit) |
 | `credit_memo_references` | the referenced invoice exists | count found | credit memos for invoices that do not exist |
+| `file_version_shrink` | the largest earlier record count of a file name | the current version's count | a re-issue that withdraws data (deliberate or not, a person confirms it) |
 
-**When can quarantine account for a variance?** Each check's header in `sql/gold/recon_checks.sql` declares:
-- which feeds can account for it;
-- how rows match (station, SKU, material, reference, or any);
-- how losing one record of each feed moves the variance. That is a signed size such as `+units` or `-deposit`, a direction only (`+?`, `-?`), or `?`.
+Bank rows are keyed by statement file and line (`bank_statement_20250304.csv#3: ...`), so a row keeps its key from run to run and `recon_changes` can track it.
 
-From each quarantined record, [`sql/gold/quarantine_facts.sql`](../factorysim/etl/sql/gold/quarantine_facts.sql) recovers:
+**Evidence.** Each check's header in `sql/gold/recon_checks.sql` declares which feeds can affect it and how rows match (station, SKU, material, reference, or any). Every row carries `candidate_records` and `candidates`: the quarantined records from those feeds, dated in the row's window, whose key matches or could not be recovered. [`sql/gold/quarantine_facts.sql`](../factorysim/etl/sql/gold/quarantine_facts.sql) recovers from each quarantined record:
 - **its key and its own business date**, so a back-dated line in a July file counts for June;
-- **its size where possible:** quantities and amounts that parse; a bank line's deposit or payment; a lost MES row's units from the station's issued-minus-produced gap; and an upper bound on several lost rows at one station on one day;
-- **whether a record with the same key has since loaded into silver.** If so the record is *released*: its data is accounted for, and it explains nothing.
+- **whether it has been released**: a record with the same natural key has since loaded into silver from the same or a newer extract and, where both carry one, the same or a higher MES revision. A released record is a corrected re-send; it is no longer offered as evidence. A quarantined revision 2 is *not* released by a revision 1 that is already in silver.
 
-Records with a known key certainly contribute their effect. Records whose key could not be recovered *may* contribute. The verdict:
-- **Explained:** the variance equals the certain effects plus some subset of the possible ones (at most 12 candidates).
-- **Needs review:** some size is unknown, its direction fits and the bound holds, or there are more than 12 candidates.
-- **Exception:** neither holds, for example the size and direction cannot account for the variance.
+Evidence helps whoever triages an exception; it changes no status. The summary table counts exceptions with and without evidence.
 
-The evaluator scores an injected business error as *surfaced* if every reconciliation row it touches is an exception, needs review, or is open. One that ends up "explained" counts as masked and missed. Across defect seeds 1–8, none were masked.
+**How the evaluator scores it.** An injected business error is *caught* when every reconciliation row it touches is an exception, and *open* when a row is still inside the late-arrival window at the end of the run; open is reported separately and not counted as caught. Every row a lost (quarantined) record lands in must be raised, with that record attached as evidence. Any other exception is *unexpected*. The README's robustness table also runs the published seed as weekly incremental batches and reports how many exceptions were raised and later cleared (transient) and how long business errors took to be raised.
 
 ## AWS mapping
 
@@ -134,7 +134,7 @@ The evaluator scores an injected business error as *surfaced* if every reconcili
 | `ingest.py` | Glue Python shell job or Lambda on `s3:ObjectCreated`; the ingest log becomes a DynamoDB table or an Iceberg table |
 | silver SQL | Glue Spark jobs (`aws/glue/` has the MES one), with `partitionOverwriteMode=dynamic` and job bookmarks over bronze to find touched months |
 | quarantine | S3 prefix plus a Catalog table; alerts on new reason codes |
-| gold and reconciliation | Athena CTAS or views; exceptions to SNS |
+| gold and reconciliation | Athena CTAS or views, or a Glue Spark job; exceptions to SNS. The SQL is DuckDB's dialect: macros, `LATERAL` subqueries, `list()` and `arg_max` would need porting to Trino or Spark SQL |
 | `catalog.duckdb` | Glue Data Catalog (one database per layer) |
 | `factorysim etl` | Glue workflow or Step Functions on EventBridge schedule/arrival |
 
@@ -156,7 +156,7 @@ Spark runs with `timeParserPolicy=CORRECTED`, and an empty bookmark batch is ski
 
 The data here is about 25k records a year. Three things would change at production volume:
 
-- **Ingestion is cheap; silver is O(history).** Ingestion skips unchanged landing files by size and modification time (on S3, the ETag), so a no-op run reads no landing data. Every run still reads all of bronze to recompute silver, so the cost of a daily run grows with history. Fixes, in order of preference:
+- **Ingestion is cheap; silver is O(history).** Ingestion skips unchanged landing files by size, modification and change time (on S3, the ETag), so a no-op run reads no landing data. Every run still reads all of bronze to recompute silver, so the cost of a daily run grows with history. Fixes, in order of preference:
   1. move silver to Iceberg (or Delta/Hudi) and `MERGE` changed keys, using a key-to-partition index instead of a full recompute;
   2. or bound corrections to a lookback window (for example 35 days of arrivals), with older corrections going through an explicit backfill.
 - **Bronze is one small Parquet file per landed file** (1,651 files, a few KB each), which is the classic small-files problem on S3. A daily compaction job should merge each arrival partition, keeping the ingest log as the source of file identity.
@@ -166,5 +166,5 @@ The data here is about 25k records a year. Three things would change at producti
 
 - Data contracts per feed (column names, types, allowed values) checked at bronze, with an alert on schema drift instead of silent `coalesce` across versions.
 - Volume and freshness monitors per feed (expected files per day, records per file).
-- Quarantine replay: a corrected re-send of a quarantined record should release it automatically. Today it is simply superseded if it carries the same key.
+- Exception workflow: an owner, a comment and an "accepted" flag per reconciliation row, kept across runs, so a confirmed variance stops being re-raised.
 - A larger generated dataset (more stations, multiple years) to measure run time and the cost of the full-bronze read.

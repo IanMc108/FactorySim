@@ -47,9 +47,13 @@ def _strict_ts(col, pattern: str, fmt: str):
 
 
 def _strict_int(col):
-    """Plain digits only: "10.5", "1e3" and "1_000" are rejected, never rounded."""
+    r"""Plain digits only: "10.5", "1e3" and "1_000" are rejected, never rounded.
+
+    Patterns are anchored with \A and \z: in Java regex "$" also matches before a final
+    newline, which would let "10\n" through where DuckDB's full match rejects it.
+    """
     trimmed = F.trim(col)
-    return F.when(trimmed.rlike(r"^-?[0-9]+$"), trimmed.cast("bigint"))
+    return F.when(trimmed.rlike(r"\A-?[0-9]+\z"), trimmed.cast("bigint"))
 
 
 def current_versions(ingest_log: DataFrame) -> DataFrame:
@@ -90,6 +94,7 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
         "_record_number",
         "_arrival_date",
         "_file_business_date",
+        "_arrival_ts",
         "_ingest_seq",
         "_parse_error",
         "_raw",
@@ -99,11 +104,11 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
         _field("event_ts_utc").isNotNull().alias("_is_v2"),
         _strict_ts(
             _field("event_ts_utc"),
-            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+            r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z",
             "yyyy-MM-dd'T'HH:mm:ss'Z'",
         ).alias("_v2_ts_utc"),
         _strict_ts(
-            _field("event_time"), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", "yyyy-MM-dd HH:mm:ss"
+            _field("event_time"), r"\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\z", "yyyy-MM-dd HH:mm:ss"
         ).alias("_v1_ts_local"),
         _upper_trim(F.coalesce(_field("station_code"), _field("station"))).alias("station_raw"),
         F.when(shift_raw.isin("A", "1"), "A")
@@ -172,6 +177,8 @@ def transform(
     latest_first = Window.partitionBy("event_id").orderBy(
         F.col("revision").desc(),
         F.col("_file_business_date").desc(),
+        F.col("_arrival_date").desc(),
+        F.col("_arrival_ts").desc(),
         F.col("_ingest_seq").desc(),
         F.col("_record_number").desc(),
     )

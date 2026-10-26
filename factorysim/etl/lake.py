@@ -13,6 +13,7 @@ prefixes with the Glue Data Catalog in place of catalog.duckdb.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ INGEST_LOG_SCHEMA = pa.schema(
         ("file", pa.string()),
         ("sha256", pa.string()),
         ("arrival_date", pa.date32()),
+        ("arrival_ts", pa.timestamp("us")),
         ("file_business_date", pa.date32()),
         ("status", pa.string()),
         ("error", pa.string()),
@@ -45,6 +47,7 @@ INGEST_LOG_SCHEMA = pa.schema(
         ("parse_errors", pa.int64()),
         ("size", pa.int64()),
         ("mtime_ns", pa.int64()),
+        ("ctime_ns", pa.int64()),
         ("ingested_at", pa.timestamp("us")),
     ]
 )
@@ -125,7 +128,8 @@ class Lake:
         if not glob:
             return None
         return conn.execute(
-            f"SELECT max(arrival_date) FROM read_parquet('{glob}', hive_partitioning = false)"
+            f"SELECT max(arrival_date) FROM read_parquet('{glob}', hive_partitioning = false, "
+            "union_by_name = true) WHERE status <> 'rejected'"
         ).fetchone()[0]
 
     def next_batch_id(self) -> str:
@@ -142,6 +146,7 @@ class Lake:
             "file": f.relative,
             "sha256": r.sha256,
             "arrival_date": f.arrival_date,
+            "arrival_ts": f.arrival_ts,
             "file_business_date": f.business_date,
             "status": r.status,
             "error": r.error,
@@ -151,6 +156,7 @@ class Lake:
             "parse_errors": r.parse_errors,
             "size": f.size,
             "mtime_ns": f.mtime_ns,
+            "ctime_ns": f.ctime_ns,
             "ingested_at": datetime.now(timezone.utc).replace(tzinfo=None),
         }
         table = pa.Table.from_pylist([row], schema=INGEST_LOG_SCHEMA)
@@ -177,14 +183,17 @@ class Lake:
         """Create temp table current_versions(source, file_name, sha256) from the log.
 
         The current version of a file name is its loaded or duplicate entry with the latest
-        arrival date, then the latest ingest sequence.
+        arrival date, then the latest ingest sequence. One arrival folder holds one path per
+        file name, so within a folder the latest log entry is what is on disk now, even if
+        the file was overwritten by a copy with an older modification time.
         """
         glob = self._log_glob()
         source = (
             f"read_parquet('{glob}', hive_partitioning = false, union_by_name = true)"
             if glob
             else "(SELECT NULL::VARCHAR AS source, NULL::VARCHAR AS file, NULL::VARCHAR AS sha256, "
-            "NULL::DATE AS arrival_date, NULL::BIGINT AS seq, NULL::VARCHAR AS status) WHERE false"
+            "NULL::DATE AS arrival_date, NULL::TIMESTAMP AS arrival_ts, NULL::BIGINT AS seq, "
+            "NULL::VARCHAR AS status) WHERE false"
         )
         conn.execute(
             f"""CREATE OR REPLACE TEMP TABLE current_versions AS
@@ -196,10 +205,52 @@ class Lake:
                     ORDER BY arrival_date DESC, seq DESC) = 1"""
         )
 
-    def remove_orphan_bronze(self, conn: duckdb.DuckDBPyConnection) -> set[Path]:
-        """Delete bronze files with no ingest-log entry (left by a crash mid-file).
+    def file_versions(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Create temp view file_versions: per file name, its versions and record counts."""
+        glob = self._log_glob()
+        if not glob:
+            conn.execute(
+                """CREATE OR REPLACE TEMP VIEW file_versions AS
+                   SELECT NULL::VARCHAR AS source, NULL::VARCHAR AS file_name,
+                          NULL::DATE AS file_business_date, NULL::BIGINT AS versions,
+                          NULL::BIGINT AS current_records, NULL::BIGINT AS max_earlier_records
+                   WHERE false"""
+            )
+            return
+        conn.execute(
+            f"""CREATE OR REPLACE TEMP VIEW file_versions AS
+                WITH log AS (
+                    SELECT *, regexp_extract(file, '[^/]+$') AS file_name
+                    FROM read_parquet('{glob}', hive_partitioning = false, union_by_name = true)
+                    WHERE status IN ('loaded', 'duplicate_content')
+                ),
+                content AS (
+                    SELECT source, file_name, sha256, max(records) AS records
+                    FROM log WHERE status = 'loaded' GROUP BY ALL
+                ),
+                ranked AS (
+                    SELECT l.source, l.file_name, l.file_business_date, c.records,
+                           row_number() OVER (
+                               PARTITION BY l.source, l.file_name
+                               ORDER BY l.arrival_date DESC, l.arrival_ts DESC NULLS LAST,
+                                        l.seq DESC) AS rn,
+                           count(*) OVER (PARTITION BY l.source, l.file_name) AS versions
+                    FROM log l JOIN content c USING (source, file_name, sha256)
+                )
+                SELECT source, file_name, any_value(file_business_date) AS file_business_date,
+                       max(versions) AS versions,
+                       max(records) FILTER (WHERE rn = 1) AS current_records,
+                       coalesce(max(records) FILTER (WHERE rn > 1), 0) AS max_earlier_records
+                FROM ranked GROUP BY source, file_name"""
+        )
 
-        Lists bronze once and returns the bronze files that remain.
+    def recover_orphan_bronze(self, conn: duckdb.DuckDBPyConnection) -> set[Path]:
+        """Re-register bronze files that have no ingest-log entry; never delete bronze.
+
+        An orphan is left by a crash between writing a bronze file and logging it, or by a
+        lost control table. Every bronze file carries its ingest metadata, so its log entry
+        is rebuilt from the file itself. A file without readable metadata is moved to
+        ``_orphaned/`` for a person to look at. Returns the bronze files now in the log.
         """
         expected = {
             self.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
@@ -207,12 +258,47 @@ class Lake:
             if r["status"] == "loaded"
         }
         present = set((self.root / "bronze").glob("*/*/*.parquet"))
-        for p in present - expected:
-            p.unlink()
+        for orphan in sorted(present - expected):
+            meta = (pq.read_schema(orphan).metadata or {}).get(b"factorysim.ingest")
+            if meta is None:
+                target = self.root / "_orphaned" / orphan.relative_to(self.root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(orphan, target)
+                present.discard(orphan)
+                continue
+            m = json.loads(meta)
+            row = {
+                "batch_id": m["batch_id"],
+                "seq": m["seq"],
+                "source": m["source"],
+                "file": m["file"],
+                "sha256": m["sha256"],
+                "arrival_date": date.fromisoformat(m["arrival_date"]),
+                "arrival_ts": datetime.fromisoformat(m["arrival_ts"]),
+                "file_business_date": date.fromisoformat(m["file_business_date"]),
+                "status": "loaded",
+                "error": "recovered from bronze metadata",
+                "encoding": m["encoding"],
+                "records": m["records"],
+                "header_repeats": m["header_repeats"],
+                "parse_errors": m["parse_errors"],
+                "size": m["size"],
+                "mtime_ns": m["mtime_ns"],
+                "ctime_ns": m["ctime_ns"],
+                "ingested_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            }
+            atomic_write_table(
+                pa.Table.from_pylist([row], schema=INGEST_LOG_SCHEMA),
+                self.root
+                / "_control"
+                / "ingest_log"
+                / f"batch_id={m['batch_id']}"
+                / f"{m['seq']:08d}.parquet",
+            )
         for folder in ("bronze", "_control"):
             for tmp in (self.root / folder).rglob("*.tmp"):
                 tmp.unlink()
-        return present & expected
+        return present
 
     @contextmanager
     def lock(self) -> Iterator[None]:
