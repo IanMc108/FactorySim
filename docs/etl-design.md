@@ -23,7 +23,8 @@ lake/
   silver/<entity>/business_month=YYYY-MM/part-0.parquet             synced by month fingerprint
   quarantine/<feed>/business_month=YYYY-MM/part-0.parquet           synced by month fingerprint
   gold/<table>/part-0.parquet                                       full rebuild
-  _control/ingest_log/batch_id=NNNNNN/<seq>.parquet                 one entry per file version
+  _control/ingest_log/batch_id=NNNNNN/batch.parquet                 one row per file arrival
+  _control/run.lock                                                 present while a run is active
   catalog.duckdb                                                    views, rebuilt each run
 ```
 
@@ -33,21 +34,23 @@ Bronze is partitioned by **arrival** date, because that is when the pipeline lea
 
 Each `factorysim etl [--through DATE]` run does the following:
 
-1. **Clean up.** Delete bronze files that have no ingest-log entry (a crash between writing a file and logging it), and treat logged bronze files that have gone missing as never seen.
+1. **Lock and clean up.** Take `_control/run.lock`, or refuse to run. Delete bronze files that have no ingest-log entry (a crash between writing a file and logging it), and treat logged bronze files that have gone missing as never loaded. Bronze is listed once for both.
 2. **Discover** landed files (optionally only those with arrival date ≤ `--through`), in arrival order. Marker files (`_SUCCESS`, dotfiles) are ignored.
-3. **Ingest** each file version, keyed by path and SHA-256, and commit it before moving on:
+3. **Ingest** each arrival and commit it before moving on:
 
    | Case | Outcome |
    |---|---|
-   | Same path, same hash | Skipped (a re-run) |
-   | Same hash at another path | Logged `duplicate_content` and skipped (a re-delivery) |
-   | New hash at a known path, or a known file name in a later arrival folder | Loaded as a new version |
+   | Same path, same size and modification time as its last entry | Skipped without reading the file |
+   | Same path, same SHA-256 as its last entry | Logged `touched` (new size/mtime, so the next run skips the read) |
+   | Content already loaded under this file name | Logged `duplicate_content` and not stored again (a re-delivery, or a revert) |
    | Name or folder that breaks the convention, or bytes that decode as neither UTF-8 nor Windows-1252 | Logged `rejected` with the error; the batch carries on |
    | Anything else | Split into records and written to bronze with lineage |
 
-   Records that do not split into the header's columns are kept with `_parse_error`; a short row also keeps its leading columns by position. Repeated header lines are dropped.
+   Records that do not split into the header's columns are kept with `_parse_error`; a short row also keeps its leading columns by position. Repeated header lines are dropped. At the end of the batch, its per-file log entries are compacted into one file.
+
+   The **current version** of each file name is then read from the log: the `loaded` or `duplicate_content` entry with the latest arrival date, then the latest sequence. Silver only sees that version's records. This one rule handles in-place overwrites, re-sends, reverts (A→B→A), header-only re-issues that withdraw every record, and versions that land in an earlier arrival folder, identically in incremental and full runs.
 4. **Silver.** For each entity:
-   - keep only the latest version of each file name (so a re-issued file replaces its predecessor completely);
+   - keep only the records of each file name's current version;
    - run the entity's SQL to type, conform and validate every record;
    - send rejected rows to quarantine, and deduplicate valid rows on the natural key, latest first;
    - fingerprint every business month (row count plus a sum of row hashes) on both the new result and the lake; rewrite the months that differ and delete months left empty.
@@ -57,7 +60,7 @@ Each `factorysim etl [--through DATE]` run does the following:
 **Why recompute silver from all of bronze?** Deduplication and "latest wins" need every version of a key, and a correction can move a record to another month: the first version of this pipeline only rewrote the months its new records fell in, and left a stale copy behind in the old month. Fingerprinting every month makes the write set exactly the months whose content changed, so there is no "touched months" logic to get wrong. The cost is reading all of bronze on every run (see *Scale and cost*).
 
 **Correctness guarantees, each with a test:**
-- Re-running with no new files writes nothing and leaves every table unchanged.
+- Re-running with no new files reads no landing file, rewrites no silver or quarantine partition and leaves every table's content unchanged. Gold and the catalog are rebuilt, with the same content.
 - Uneven incremental batches produce output identical to one full run, including a batch that straddles the MES schema change.
 - A correction that moves a record across months leaves exactly one copy, both incrementally and in a full run.
 - Gold matches the truth exactly, except for cells that differ only because a record was unrecoverable. This holds for eight different defect seeds.
@@ -80,9 +83,9 @@ Bank statements carry no transaction ID, so the running balance is part of the k
 
 ## Time
 
-- MES v1 (to 2025-06-30) and material issues use plant-local wall time (America/Chicago). These are converted to UTC with DuckDB's ICU time zones, and the Spark port uses `to_utc_timestamp`. The exporter never emits a local time that does not exist (the spring-forward gap).
-  - **Ambiguous fall-back times (01:00–02:00 on the first Sunday of November)** are a known gap. DuckDB resolves them to the later, standard-time occurrence, and the exporter's Python `zoneinfo` writes the earlier one, so they would disagree by an hour. The ambiguity cannot change a business date, and no local timestamp in this data falls in that hour: v1 MES ends in June, and material issues happen at shift start. A real feed would need a UTC offset column or an explicit policy.
-- MES v2 timestamps are UTC (`...Z`), and maintenance-system timestamps carry offsets.
+- MES v1 (to 2025-06-30) and material issues use plant-local wall time (America/Chicago). These are converted to UTC with DuckDB's ICU time zones, and the Spark port uses `to_utc_timestamp`. Every timestamp must match its exact pattern (`YYYY-MM-DD HH:MM:SS`, or `...THH:MM:SSZ` with a capital Z), because the two engines' parsers disagree on anything looser.
+- **A local time that cannot be placed on the UTC timeline is quarantined**, as `nonexistent_local_time` (inside the spring-forward gap) or `ambiguous_local_time` (the fall-back hour happens twice). Both engines detect these the same way, by converting to UTC and back, ±1 hour. The exporter never emits such times; a real feed would need a UTC offset column to avoid the loss.
+- MES v2 timestamps are UTC (`...Z`). Maintenance-system timestamps must carry an offset; one without is quarantined, not assumed to be UTC.
 - **Production day:** the night shift (C/3) runs from 22:00 to 06:00, and events after midnight belong to the day the shift started on.
 
 ## Reconciliation
@@ -90,33 +93,38 @@ Bank statements carry no transaction ID, so the running balance is part of the k
 Every check returns `(business_date, key, expected, actual)`, and one wrapper assigns its status:
 
 1. `matched`: the variance is 0;
-2. `explained_by_quarantine`: the variance is what the related quarantined records would cause (below);
+2. `explained_by_quarantine`: the variance is exactly what the related open quarantined records would cause;
 3. `open_late_window`: the date is within 7 days of the latest arrival, so late files may still close the gap;
-4. `exception`: none of the above.
+4. `needs_review`: a related quarantined record of unknown size could cause it (its direction fits, and the variance is within any bound on its size), or there are too many candidate records to check. A person has to look;
+5. `exception`: none of the above.
 
 | Check | Expected | Actual | Catches |
 |---|---|---|---|
-| `mass_balance` | units issued to a station | graded units produced | lost or duplicated MES records |
-| `production_vs_sales` | good units produced | net units invoiced | billing errors, lost invoice lines |
+| `mass_balance` | units issued to a station | graded units produced | lost or duplicated MES records, a missing MES file |
+| `production_vs_sales` | good units produced | net units invoiced | billing errors, lost invoice lines, a missing MES file |
 | `customer_receipts` | net invoiced revenue | lockbox deposits | billing errors, missing deposits |
-| `supplier_payments` | goods-receipt value per PO | bank payments for the PO within 3 days | unpaid, double-paid or late-paid receipts, UoM errors; payments without a receipt get their own row |
+| `supplier_payments` | goods-receipt value per PO (all partial deliveries) | bank payments for the PO from the first delivery to 3 days after the last | unpaid, double-paid or late-paid receipts, UoM errors; payments outside the window get their own row |
 | `maintenance_payments` | work-order cost | bank payments for the WO within 3 days | duplicate or missing completions, double or late payments |
 | `inventory_roll_forward` | previous snapshot + receipts − issues | snapshot | lost receipts or issues, UoM errors |
 | `bank_balance_continuity` | previous balance + amount, per line | reported balance | missing, duplicated or corrupted statement lines |
+| `credit_memo_references` | the referenced invoice exists | count found | credit memos for invoices that do not exist |
 
-**When does quarantine explain a variance?** Each check's header in `sql/gold/recon_checks.sql` declares three things:
-- which feeds can explain it;
-- how rows match: by station, SKU, material or reference, or any;
-- how one lost record of each feed moves the variance (for example `mes_production:+units_recovered, erp_invoices:-units`).
+**When can quarantine account for a variance?** Each check's header in `sql/gold/recon_checks.sql` declares:
+- which feeds can account for it;
+- how rows match (station, SKU, material, reference, or any);
+- how losing one record of each feed moves the variance. That is a signed size such as `+units` or `-deposit`, a direction only (`+?`, `-?`), or `?`.
 
-The pipeline recovers what it can from each quarantined record, its key and size. A lost MES production record's size is recovered from the station's material issues for that day. Then:
+From each quarantined record, [`sql/gold/quarantine_facts.sql`](../factorysim/etl/sql/gold/quarantine_facts.sql) recovers:
+- **its key and its own business date**, so a back-dated line in a July file counts for June;
+- **its size where possible:** quantities and amounts that parse; a bank line's deposit or payment; a lost MES row's units from the station's issued-minus-produced gap; and an upper bound on several lost rows at one station on one day;
+- **whether a record with the same key has since loaded into silver.** If so the record is *released*: its data is accounted for, and it explains nothing.
 
-- **Known key:** records whose key matches the row certainly contribute their effect.
-- **Unknown key:** records whose key could not be recovered *may* contribute.
-- **Verdict:** the variance is explained only if it equals the certain effects plus some subset of the possible ones.
-- **Unknown size:** if any related record's size is unrecoverable, the check cannot be bounded, and any variance on that row counts as explained.
+Records with a known key certainly contribute their effect. Records whose key could not be recovered *may* contribute. The verdict:
+- **Explained:** the variance equals the certain effects plus some subset of the possible ones (at most 12 candidates).
+- **Needs review:** some size is unknown, its direction fits and the bound holds, or there are more than 12 candidates.
+- **Exception:** neither holds, for example the size and direction cannot account for the variance.
 
-The evaluator scores an injected billing error as *caught* only if it surfaces as an exception or open row. Masked errors count as missed. Across defect seeds 1–8 none were masked. The last rule above remains the known weakness: a billing error on the same day as a truncated invoice line (whose amount is lost) would be masked.
+The evaluator scores an injected business error as *surfaced* if every reconciliation row it touches is an exception, needs review, or is open. One that ends up "explained" counts as masked and missed. Across defect seeds 1–8, none were masked.
 
 ## AWS mapping
 
@@ -130,13 +138,25 @@ The evaluator scores an injected billing error as *caught* only if it surfaces a
 | `catalog.duckdb` | Glue Data Catalog (one database per layer) |
 | `factorysim etl` | Glue workflow or Step Functions on EventBridge schedule/arrival |
 
-On Glue, a job bookmark over bronze only tells the job *whether* new files arrived. The job then recomputes silver from the whole bronze prefix and syncs partitions by month fingerprint, the same way as locally, because a correction can move a record to a month that no new file mentions. `tests/test_glue_parity.py` checks the Spark transform against the DuckDB output, row for row, on a generated half-year and on hand-made hostile records (fractional quantities, `1e3`, fractional-second timestamps, legacy codes, a DST night shift, a correction that changes month). The Glue entry point (`main()`, including partition sync) is not exercised locally and has never been deployed.
+On Glue, a job bookmark over bronze only tells the job *whether* new files arrived. The job then:
+1. reads the ingest log to find each file name's current version (`current_versions`);
+2. recomputes silver from the whole bronze prefix;
+3. syncs partitions by month fingerprint, as locally, because a correction can move a record to a month that no new file mentions.
+
+Spark runs with `timeParserPolicy=CORRECTED`, and an empty bookmark batch is skipped. `tests/test_glue_parity.py` checks the Spark transform against the DuckDB output row for row, on three kinds of input:
+- a generated half-year;
+- hand-made hostile records (fractional quantities, `1e3`, fractional-second timestamps, legacy codes, DST nights, a correction that changes month);
+- three seeded batches of fuzzed records.
+
+`aws/athena/silver_production_events.sql` declares the table with partition projection, so months that partition sync adds or deletes need no `MSCK REPAIR` or crawler. Two caveats:
+- **The Glue entry point (`main()`) has never run on AWS.**
+- **Partition sync is overwrite-then-delete, not atomic.** A reader can see a half-updated set of months, and Iceberg would fix that.
 
 ## Scale and cost
 
 The data here is about 25k records a year. Three things would change at production volume:
 
-- **Every run reads all of bronze**, so the cost of a daily run grows with history. Fixes, in order of preference:
+- **Ingestion is cheap; silver is O(history).** Ingestion skips unchanged landing files by size and modification time (on S3, the ETag), so a no-op run reads no landing data. Every run still reads all of bronze to recompute silver, so the cost of a daily run grows with history. Fixes, in order of preference:
   1. move silver to Iceberg (or Delta/Hudi) and `MERGE` changed keys, using a key-to-partition index instead of a full recompute;
   2. or bound corrections to a lookback window (for example 35 days of arrivals), with older corrections going through an explicit backfill.
 - **Bronze is one small Parquet file per landed file** (1,651 files, a few KB each), which is the classic small-files problem on S3. A daily compaction job should merge each arrival partition, keeping the ingest log as the source of file identity.

@@ -30,50 +30,8 @@ from .lake import Lake, _q, atomic_copy
 
 LATE_ARRIVAL_WINDOW_DAYS = 7
 PAYMENT_TERMS_DAYS = 3
-
-# Best-effort facts recovered from quarantined records, so reconciliation can tell which
-# variances a quarantined record could account for. NULL means "not recoverable".
-QUARANTINE_FACTS = """
-CREATE OR REPLACE TEMP VIEW quarantine_facts AS
-WITH q AS (SELECT *, TRY_CAST(record AS JSON) AS r FROM quarantine_all),
-facts AS (
-    SELECT
-        q._source,
-        q._file_business_date AS business_date,
-        sa.station_code AS station,
-        ka.sku,
-        m.material_code AS material,
-        NULLIF(coalesce(trim(r ->> 'po_number'), trim(r ->> 'work_order'),
-                        regexp_extract(r ->> 'Description', '((PO|WO)-[0-9-]+)', 1)), '')
-            AS reference,
-        abs(strict_int(coalesce(r ->> 'quantity', r ->> 'qty'))) AS units,
-        abs(money(r ->> 'line_amount')) AS amount
-    FROM q
-    LEFT JOIN ref_station_aliases sa
-        ON sa.alias = upper(trim(coalesce(r ->> 'station_code', r ->> 'station')))
-    LEFT JOIN ref_sku_aliases ka
-        ON ka.alias = upper(trim(coalesce(r ->> 'item_code', r ->> 'sku')))
-    LEFT JOIN ref_materials m ON m.material_code = upper(trim(r ->> 'material'))
-),
--- A lost MES production record of unknown size is the station's material issued minus
--- output recorded that day, when it is the only such record for that station and day.
-mes_gap AS (
-    SELECT i.business_date, i.station_code AS station, i.units - coalesce(p.units, 0) AS gap
-    FROM (SELECT business_date, station_code, sum(qty) AS units
-          FROM silver_material_issues GROUP BY ALL) i
-    LEFT JOIN (SELECT business_date, station_code, sum(units) AS units
-               FROM fct_production_daily GROUP BY ALL) p USING (business_date, station_code)
-)
-SELECT f.*,
-       CASE WHEN f.units IS NOT NULL THEN f.units
-            WHEN f._source = 'mes_production'
-                 AND count(*) FILTER (WHERE f.units IS NULL)
-                     OVER (PARTITION BY f._source, f.business_date, f.station) = 1
-                THEN g.gap
-       END AS units_recovered
-FROM facts f
-LEFT JOIN mes_gap g ON g.business_date = f.business_date AND g.station = f.station
-"""
+MAX_OPTIONAL_EFFECTS = 12
+STATUSES = ("matched", "explained_by_quarantine", "open_late_window", "needs_review", "exception")
 
 
 @dataclass(frozen=True)
@@ -107,13 +65,28 @@ ENTITIES = (
 MACROS = r"""
 CREATE OR REPLACE MACRO strict_int(s) AS
     CASE WHEN regexp_full_match(trim(s), '-?[0-9]+') THEN TRY_CAST(trim(s) AS BIGINT) END;
--- True if req plus some subset of opts equals target (opts: up to 12 optional effects).
+-- True if req plus some subset of opts equals target. Callers keep opts to at most
+-- MAX_OPTIONAL_EFFECTS elements; a longer list is never "explained" (see build_gold).
 CREATE OR REPLACE MACRO subset_sum_matches(req, opts, target) AS
     CASE WHEN opts IS NULL OR len(opts) = 0 THEN req = target
-         WHEN len(opts) > 12 THEN true
+         WHEN len(opts) > 12 THEN false
          ELSE len(list_filter(range(0, 1 << len(opts)), lambda m:
               req + list_sum(list_transform(range(len(opts)), lambda i:
                   CASE WHEN ((m >> i) & 1) = 1 THEN opts[i + 1] ELSE 0 END)) = target)) > 0
+    END;
+-- Timestamps must match their pattern exactly (no single-digit fields or stray spaces).
+CREATE OR REPLACE MACRO strict_ts(s, pattern, fmt) AS
+    CASE WHEN regexp_full_match(s, pattern) THEN try_strptime(s, fmt) END;
+CREATE OR REPLACE MACRO local_to_utc(t) AS timezone('UTC', timezone('America/Chicago', t));
+CREATE OR REPLACE MACRO utc_to_local(t) AS timezone('America/Chicago', timezone('UTC', t));
+-- A plant-local wall time that does not exist (spring-forward gap) or exists twice
+-- (fall-back hour) cannot be placed on the UTC timeline without guessing.
+CREATE OR REPLACE MACRO local_time_problem(t) AS
+    CASE WHEN t IS NULL THEN NULL
+         WHEN utc_to_local(local_to_utc(t)) <> t THEN 'nonexistent_local_time'
+         WHEN utc_to_local(local_to_utc(t) + INTERVAL 1 HOUR) = t
+              OR utc_to_local(local_to_utc(t) - INTERVAL 1 HOUR) = t
+             THEN 'ambiguous_local_time'
     END;
 CREATE OR REPLACE MACRO money(s) AS
     CASE WHEN regexp_full_match(regexp_replace(s, '[$,\s]', '', 'g'), '-?[0-9]+(\.[0-9]{1,4})?')
@@ -177,10 +150,11 @@ def _load_reference(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _bronze_view(conn: duckdb.DuckDBPyConnection, lake: Lake, source: str) -> None:
-    """Bronze for one feed, keeping only the latest ingested version of each file name.
+    """Bronze for one feed, keeping only the records of each file name's current version.
 
-    A file re-issued under the same name (an in-place overwrite, or a corrected statement
-    re-sent in a later arrival folder) replaces every record of its earlier versions.
+    The current version comes from the ingest log (``Lake.current_versions``), so a file
+    re-issued under the same name replaces every record of its earlier versions, including
+    when the re-issue is a revert or has no records at all.
     """
     glob = lake.bronze_glob(source)
     if glob:
@@ -190,9 +164,11 @@ def _bronze_view(conn: duckdb.DuckDBPyConnection, lake: Lake, source: str) -> No
         relation = "_empty_bronze"
     conn.execute(
         f"""CREATE OR REPLACE TEMP VIEW bronze AS
-            SELECT * REPLACE (record::JSON AS record) FROM {relation}
-            QUALIFY _ingest_seq = max(_ingest_seq)
-                OVER (PARTITION BY regexp_extract(_file, '[^/]+$'))"""
+            SELECT b.* REPLACE (b.record::JSON AS record) FROM {relation} b
+            SEMI JOIN current_versions v
+                ON v.source = b._source
+               AND v.file_name = regexp_extract(b._file, '[^/]+$')
+               AND v.sha256 = b._file_sha256"""
     )
 
 
@@ -316,29 +292,40 @@ def build_gold(conn, lake: Lake, watermark: date) -> dict[str, dict[str, int]]:
         conn.execute(f"CREATE OR REPLACE TEMP TABLE {table} AS {sql}")
         tables.append(table)
 
-    conn.execute(QUARANTINE_FACTS)
+    conn.execute(
+        "CREATE OR REPLACE TEMP VIEW quarantine_facts AS " + _sql("gold", "quarantine_facts.sql")
+    )
     checks = []
     for header, sql in _sections(_sql("gold", "recon_checks.sql"), "check"):
         name, *options = (part.strip() for part in header.split("|"))
         opts = dict(o.split("=", 1) for o in options)
-        # effect=<feed>:<sign><measure>, ... : how losing one record of that feed moves the
-        # variance (actual - expected); "?" means its size cannot be recovered.
+        # effect=<feed>:<effect>, ... : how losing one record of that feed moves the variance
+        # (actual - expected). <effect> is +measure or -measure (e.g. +units), +? or -? when
+        # only the direction is known, or ? when even that is not.
         effects = [e.strip().split(":") for e in opts["effect"].split(",")]
         related = ", ".join(f"'{feed}'" for feed, _ in effects)
 
-        def effect_sql(eff: str) -> str:
-            return "NULL" if eff == "?" else f"{'-' if eff[0] == '-' else ''}q.{eff[1:]}"
+        def size_sql(eff: str) -> str:
+            if eff.endswith("?"):
+                return "NULL"
+            return f"{'-' if eff[0] == '-' else ''}q.{eff[1:]}"
 
-        contribution = " ".join(
-            f"WHEN q._source = '{feed}' THEN {effect_sql(eff)}" for feed, eff in effects
-        )
+        def direction(eff: str) -> int:
+            return {"+": 1, "-": -1}.get(eff[0], 0) if eff != "?" else 0
+
+        def bound_sql(eff: str) -> str:
+            return "q.units_bound" if eff[1:] == "units_recovered" else "NULL"
+
+        size = " ".join(f"WHEN q._source = '{f}' THEN {size_sql(e)}" for f, e in effects)
+        bound = " ".join(f"WHEN q._source = '{f}' THEN {bound_sql(e)}" for f, e in effects)
+        sign = " ".join(f"WHEN q._source = '{f}' THEN {direction(e)}" for f, e in effects)
         key = opts["key"]
         key_match = "TRUE" if key == "any" else f"(q.{key} IS NULL OR q.{key} = c.key)"
         # A record whose key is known certainly belongs to this row; one whose key could not
         # be recovered may or may not.
         key_known = "TRUE" if key == "any" else f"q.{key} IS NOT NULL"
         related_rows = f"""FROM quarantine_facts q
-                           WHERE q._source IN ({related}) AND {key_match}
+                           WHERE q._source IN ({related}) AND {key_match} AND NOT q.released
                              AND q.business_date
                                  BETWEEN coalesce(c.window_start, c.business_date)
                                      AND c.business_date"""
@@ -347,31 +334,53 @@ def build_gold(conn, lake: Lake, watermark: date) -> dict[str, dict[str, int]]:
                        CAST(c.expected AS DECIMAL(38, 2)) AS expected,
                        CAST(c.actual AS DECIMAL(38, 2)) AS actual,
                        CAST(c.actual - c.expected AS DECIMAL(38, 2)) AS variance,
-                       (SELECT count(*) {related_rows}) AS related_quarantined,
-                       -- How the related quarantined records would move the variance:
-                       -- certainly (known key), possibly (unknown key), or unknowably.
-                       (SELECT coalesce(sum(x) FILTER (WHERE known), 0)
-                        FROM (SELECT CASE {contribution} END AS x, {key_known} AS known
-                              {related_rows})) AS quarantine_effect,
-                       (SELECT list(x) FILTER (WHERE NOT known)
-                        FROM (SELECT CASE {contribution} END AS x, {key_known} AS known
-                              {related_rows})) AS possible_effects,
-                       (SELECT count(*) FILTER (WHERE x IS NULL)
-                        FROM (SELECT CASE {contribution} END AS x {related_rows}))
-                           AS unsized_records
-                FROM ({sql}) c"""
+                       e.*
+                FROM ({sql}) c,
+                LATERAL (
+                    SELECT count(*) AS related_quarantined,
+                           -- certainly (known key), possibly (unknown key), or of unknown size
+                           coalesce(sum(x) FILTER (WHERE known AND x IS NOT NULL), 0)
+                               AS quarantine_effect,
+                           list(x) FILTER (WHERE NOT known AND x IS NOT NULL)
+                               AS possible_effects,
+                           count(*) FILTER (WHERE x IS NULL) AS unsized_records,
+                           list(DISTINCT d) FILTER (WHERE x IS NULL) AS unsized_directions,
+                           -- the most the uncertain records could move the variance;
+                           -- NULL if some unsized record has no bound at all
+                           CASE WHEN count(*) FILTER (WHERE x IS NULL AND b IS NULL) > 0
+                                THEN NULL
+                                ELSE coalesce(sum(b) FILTER (WHERE x IS NULL), 0)
+                                     + coalesce(sum(abs(x)) FILTER (WHERE NOT known), 0)
+                           END AS uncertainty_bound
+                    FROM (SELECT CASE {size} END AS x, CASE {sign} END AS d,
+                                 CASE {bound} END AS b, {key_known} AS known
+                          {related_rows})
+                ) e"""
         )
     conn.execute(
         f"""CREATE OR REPLACE TEMP TABLE recon_results AS
             SELECT *,
                    CASE WHEN variance = 0 THEN 'matched'
-                        WHEN related_quarantined > 0
-                             AND (unsized_records > 0
-                                  OR subset_sum_matches(quarantine_effect, possible_effects,
-                                                        variance))
+                        -- Explained only if it adds up exactly.
+                        WHEN related_quarantined > 0 AND unsized_records = 0
+                             AND coalesce(len(possible_effects), 0) <= {MAX_OPTIONAL_EFFECTS}
+                             AND subset_sum_matches(quarantine_effect, possible_effects,
+                                                    variance)
                             THEN 'explained_by_quarantine'
                         WHEN business_date > DATE '{watermark}' - {LATE_ARRIVAL_WINDOW_DAYS}
                             THEN 'open_late_window'
+                        -- Plausibly caused by quarantined records whose size is unknown (but
+                        -- whose direction and bound fit), or by too many candidates to check:
+                        -- a person has to look. Never silently "explained".
+                        WHEN related_quarantined > 0
+                             AND ((unsized_records > 0
+                                   AND (list_contains(unsized_directions, 0)
+                                        OR list_contains(unsized_directions,
+                                                         sign(variance - quarantine_effect))))
+                                  OR len(possible_effects) > {MAX_OPTIONAL_EFFECTS})
+                             AND (uncertainty_bound IS NULL
+                                  OR abs(variance - quarantine_effect) <= uncertainty_bound)
+                            THEN 'needs_review'
                         ELSE 'exception'
                    END AS status
             FROM ({" UNION ALL ".join(checks)})
@@ -384,43 +393,54 @@ def build_gold(conn, lake: Lake, watermark: date) -> dict[str, dict[str, int]]:
                   count(*) FILTER (WHERE status = 'matched') AS matched,
                   count(*) FILTER (WHERE status = 'explained_by_quarantine') AS explained,
                   count(*) FILTER (WHERE status = 'open_late_window') AS open,
+                  count(*) FILTER (WHERE status = 'needs_review') AS needs_review,
                   count(*) FILTER (WHERE status = 'exception') AS exceptions
            FROM recon_results GROUP BY check_name ORDER BY check_name"""
     )
     tables.append("recon_summary")
     conn.execute(
         """CREATE OR REPLACE TEMP TABLE dq_quarantine_summary AS
-           SELECT _source AS source, reject_reason, count(*) AS records
-           FROM quarantine_all GROUP BY ALL ORDER BY ALL"""
+           SELECT _source AS source, reject_reason, count(*) AS records,
+                  count(*) FILTER (WHERE released) AS released_by_later_load
+           FROM quarantine_facts GROUP BY ALL ORDER BY ALL"""
     )
     tables.append("dq_quarantine_summary")
 
     for table in tables:
         atomic_copy(conn, f"SELECT * FROM {table}", lake.gold_file(table))
     return {
-        name: {"rows": rows, "matched": m, "explained": e, "open": o, "exceptions": x}
-        for name, rows, m, e, o, x in conn.execute("SELECT * FROM recon_summary").fetchall()
+        name: {
+            "rows": rows,
+            "matched": m,
+            "explained": e,
+            "open": o,
+            "needs_review": r,
+            "exceptions": x,
+        }
+        for name, rows, m, e, o, r, x in conn.execute("SELECT * FROM recon_summary").fetchall()
     }
 
 
 def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) -> RunSummary:
     lake = Lake(lake_root)
     lake_root.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect()
-    try:
-        conn.execute("SET TimeZone = 'UTC'")
-        conn.execute(MACROS)
-        conn.execute(f"SET VARIABLE payment_terms_days = {PAYMENT_TERMS_DAYS}")
-        _load_reference(conn)
-        batch_id = lake.next_batch_id()
-        results: list[IngestResult] = ingest(conn, lake, discover(landing, through), batch_id)
-        loaded = {r.file.relative for r in results if r.status == "loaded"}
-        entities = build_silver(conn, lake)
-        watermark = lake.watermark(conn) or date.min
-        recon = build_gold(conn, lake, watermark)
-    finally:
-        conn.close()
-    lake.write_catalog()
+    with lake.lock():
+        conn = duckdb.connect()
+        try:
+            conn.execute("SET TimeZone = 'UTC'")
+            conn.execute(MACROS)
+            conn.execute(f"SET VARIABLE payment_terms_days = {PAYMENT_TERMS_DAYS}")
+            _load_reference(conn)
+            batch_id = lake.next_batch_id()
+            results: list[IngestResult] = ingest(conn, lake, discover(landing, through), batch_id)
+            loaded = {r.file.relative for r in results if r.status == "loaded"}
+            lake.current_versions(conn)
+            entities = build_silver(conn, lake)
+            watermark = lake.watermark(conn) or date.min
+            recon = build_gold(conn, lake, watermark)
+        finally:
+            conn.close()
+        lake.write_catalog()
     return RunSummary(
         batch_id=batch_id,
         files_loaded=len(loaded),

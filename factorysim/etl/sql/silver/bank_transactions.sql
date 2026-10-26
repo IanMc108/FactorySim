@@ -3,12 +3,13 @@
 WITH parsed AS (
     SELECT
         *,
-        CAST(try_strptime(record ->> 'Date', '%m/%d/%Y') AS DATE) AS txn_date,
+        CAST(strict_ts(record ->> 'Date', '\d{2}/\d{2}/\d{4}', '%m/%d/%Y') AS DATE) AS txn_date,
         trim(record ->> 'Description') AS description,
+        NULLIF(trim(record ->> 'Debit'), '') AS debit_text,
+        NULLIF(trim(record ->> 'Credit'), '') AS credit_text,
         money(NULLIF(trim(record ->> 'Debit'), '')) AS debit,
         money(NULLIF(trim(record ->> 'Credit'), '')) AS credit,
-        money(record ->> 'Balance')
-            AS balance
+        money(record ->> 'Balance') AS balance
     FROM bronze
 )
 SELECT
@@ -17,7 +18,14 @@ SELECT
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN txn_date IS NULL THEN 'invalid_date'
         WHEN balance IS NULL THEN 'invalid_amount'
-        WHEN debit IS NOT NULL AND credit IS NOT NULL THEN 'invalid_amount'
+        -- A non-blank amount must parse; exactly one of debit and credit, and it must be
+        -- positive (the opening BALANCE FORWARD line has neither).
+        WHEN (debit_text IS NOT NULL AND debit IS NULL)
+             OR (credit_text IS NOT NULL AND credit IS NULL) THEN 'invalid_amount'
+        WHEN debit_text IS NOT NULL AND credit_text IS NOT NULL THEN 'invalid_amount'
+        WHEN debit_text IS NULL AND credit_text IS NULL
+             AND description IS DISTINCT FROM 'BALANCE FORWARD' THEN 'invalid_amount'
+        WHEN debit <= 0 OR credit <= 0 THEN 'invalid_amount'
     END AS reject_reason,
     txn_date AS business_date,
     txn_date, description,

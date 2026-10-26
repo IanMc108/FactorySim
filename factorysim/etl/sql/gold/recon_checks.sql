@@ -3,15 +3,18 @@
 -- followed by one SELECT returning (business_date, window_start, key, expected, actual).
 -- The pipeline wraps every check with the same variance and status logic (pipeline.py).
 --
--- The header says which quarantined records may explain a variance: records from the
--- listed feeds, in the row's date window, whose recovered key (station, sku, material or
--- reference) matches the row's key or could not be recovered. <effect> is how losing one
--- such record moves the variance (actual - expected): +units, -amount, ... or ? when its
--- size cannot be known. When every related record's effect is known, the variance must
--- equal their sum exactly to count as explained; otherwise any variance is "explained"
--- (the evaluator measures how often that hides a real error).
+-- The header says which quarantined records may account for a variance: open (not yet
+-- released) records from the listed feeds, dated in the row's window, whose recovered key
+-- (station, sku, material or reference) matches the row's key or could not be recovered.
+-- <effect> is how losing one such record moves the variance (actual - expected):
+--   +units / -amount ...  a recoverable size with a sign
+--   +? / -?               only the direction is known
+--   ?                     neither
+-- A variance is "explained" only if it equals the effect of the matching records exactly.
+-- If some matching record's size is unknown and its direction fits, the row "needs review";
+-- otherwise it is an exception.
 
--- check: mass_balance | key=station | effect=mes_production:?, mes_material_issues:+units
+-- check: mass_balance | key=station | effect=mes_production:-?, mes_material_issues:+units
 -- Every unit of material issued to a station comes out as exactly one graded unit.
 SELECT
     coalesce(i.business_date, p.business_date) AS business_date,
@@ -38,7 +41,7 @@ FROM (SELECT f.business_date, f.sku, sum(f.units) AS units
       WHERE r.sellable GROUP BY ALL) p
 FULL OUTER JOIN fct_sales_daily s USING (business_date, sku);
 
--- check: customer_receipts | key=any | effect=erp_invoices:+amount, bank_statements:?
+-- check: customer_receipts | key=any | effect=erp_invoices:+amount, bank_statements:-deposit
 -- Each day's net invoiced revenue is deposited the same day.
 SELECT
     coalesce(s.business_date, b.txn_date) AS business_date,
@@ -51,11 +54,13 @@ FULL OUTER JOIN (SELECT txn_date, sum(amount) AS amount FROM fct_bank_transactio
                  WHERE txn_kind = 'customer_receipts' GROUP BY ALL) b
     ON b.txn_date = s.business_date;
 
--- check: supplier_payments | key=reference | effect=erp_goods_receipts:?, bank_statements:?
--- Each PO's receipts are paid in full within the payment terms. Payments for unknown POs,
+-- check: supplier_payments | key=reference | effect=erp_goods_receipts:+?, bank_statements:-payment
+-- Each PO's receipts (possibly several partial deliveries) are paid in full between the
+-- first delivery and the payment terms after the last. Payments for unknown POs,
 -- or outside the terms window, are reported as their own rows so they cannot hide.
 WITH receipts AS (
-    SELECT po_no, min(receipt_date) AS receipt_date, sum(amount) AS amount
+    SELECT po_no, min(receipt_date) AS receipt_date, max(receipt_date) AS last_receipt_date,
+           sum(amount) AS amount
     FROM fct_goods_receipts GROUP BY po_no
 ),
 payments AS (
@@ -66,7 +71,7 @@ classified AS (
     SELECT p.*, r.receipt_date,
            r.po_no IS NOT NULL
                AND p.txn_date BETWEEN r.receipt_date
-                                  AND r.receipt_date + getvariable('payment_terms_days')
+                                  AND r.last_receipt_date + getvariable('payment_terms_days')
                AS on_terms
     FROM payments p LEFT JOIN receipts r USING (po_no)
 )
@@ -79,7 +84,7 @@ UNION ALL
 SELECT txn_date, NULL::DATE, po_no || ' (payment outside terms or without receipt)', 0, paid
 FROM classified WHERE NOT on_terms;
 
--- check: maintenance_payments | key=reference | effect=cmms_work_orders:?, bank_statements:?
+-- check: maintenance_payments | key=reference | effect=cmms_work_orders:+?, bank_statements:-payment
 -- Each completed work order is paid within the payment terms of its completion day.
 WITH orders AS (
     SELECT work_order, business_date, cost FROM fct_maintenance WHERE business_date IS NOT NULL
@@ -104,7 +109,7 @@ SELECT txn_date, NULL::DATE, work_order || ' (payment outside terms or without w
        paid
 FROM classified WHERE NOT on_terms;
 
--- check: inventory_roll_forward | key=material | effect=erp_stock_snapshots:?, erp_goods_receipts:?, mes_material_issues:?
+-- check: inventory_roll_forward | key=material | effect=erp_stock_snapshots:?, erp_goods_receipts:+?, mes_material_issues:-?
 -- Snapshot = previous snapshot + receipts - issues in between.
 WITH snaps AS (
     SELECT *, lag(snapshot_date) OVER w AS prev_date, lag(on_hand) OVER w AS prev_on_hand
@@ -138,3 +143,12 @@ SELECT txn_date AS business_date, NULL::DATE AS window_start,
        prev_balance + amount AS expected, balance AS actual
 FROM lines
 WHERE txn_kind <> 'opening_balance';
+
+-- check: credit_memo_references | key=reference | effect=erp_invoices:-?
+-- Every credit memo reverses an invoice that exists.
+SELECT cm.business_date, NULL::DATE AS window_start, cm.reference_doc AS key,
+       1 AS expected,
+       (SELECT count(DISTINCT i.doc_no) FROM silver_invoice_lines i
+        WHERE i.doc_no = cm.reference_doc AND i.doc_type = 'INV') AS actual
+FROM (SELECT DISTINCT doc_no, reference_doc, min(business_date) AS business_date
+      FROM silver_invoice_lines WHERE doc_type = 'CM' GROUP BY ALL) cm;

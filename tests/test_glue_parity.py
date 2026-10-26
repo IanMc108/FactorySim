@@ -68,7 +68,10 @@ def _compare(spark, job, lake: Path) -> int:
     stations = spark.read.option("header", True).csv(str(reference / "station_aliases.csv"))
     skus = spark.read.option("header", True).csv(str(reference / "sku_aliases.csv"))
     bronze = spark.read.parquet(str(lake / "bronze" / "mes_production"))
-    silver, quarantine = job.transform(bronze, stations, skus)
+    log = spark.read.option("mergeSchema", True).parquet(
+        str(lake / "_control" / "ingest_log" / "*" / "*.parquet")
+    )
+    silver, quarantine = job.transform(bronze, job.current_versions(log), stations, skus)
 
     spark_rows = sorted(tuple(r) for r in silver.select(*COLUMNS).collect())
     duck_rows = sorted(
@@ -152,5 +155,116 @@ def test_glue_transform_accepts_an_empty_bronze_frame(spark, job, tmp_path):
     reference = ROOT / "factorysim" / "etl" / "reference"
     stations = spark.read.option("header", True).csv(str(reference / "station_aliases.csv"))
     skus = spark.read.option("header", True).csv(str(reference / "sku_aliases.csv"))
-    silver, quarantine = job.transform(empty, stations, skus)
+    no_versions = empty.selectExpr(
+        "_source AS source", "_file AS file_name", "_file_sha256 AS sha256"
+    )
+    silver, quarantine = job.transform(empty, no_versions, stations, skus)
     assert silver.count() == quarantine.count() == 0
+
+
+def _fuzz_landing(root: Path, seed: int, n: int = 300) -> None:
+    """Write MES files full of edge-case values, deterministically."""
+    import csv
+    import io
+    import random
+
+    rnd = random.Random(seed)
+    ids = [f"F{i}" for i in range(n // 3)]  # shared ids exercise dedup and revisions
+    stations = ["LITHO-A", "lith-a", " CHEM-B ", "EPC-A", "LITHO-Z", ""]
+    skus = ["MPU-XL-A", "mpuxl-b", " SUB-PE", "MESH-AIN", "MPU-XL-SCRAP", ""]
+    qtys = ["5", "0", "-3", "10.5", "1e3", " 7 ", "007", "", "1_000", "12"]
+    revs = ["1", "2", "3", "1.0", " 2", "x", ""]
+
+    def v1_time() -> str:
+        day = rnd.choice(["2025-03-09", "2025-11-02", "2025-06-15"])
+        h, m = rnd.randrange(0, 24), rnd.randrange(0, 60)
+        good = f"{day} {h:02d}:{m:02d}:00"
+        return rnd.choice([good] * 6 + [good + ".5", " " + good, good.replace("-0", "-", 1)])
+
+    def v2_time() -> str:
+        day = rnd.choice(["2025-11-02", "2025-07-04"])
+        good = f"{day}T{rnd.randrange(24):02d}:{rnd.randrange(60):02d}:00Z"
+        return rnd.choice([good] * 6 + [good.lower(), good[:-1] + "+00:00", good[:-1]])
+
+    def write(arrival: str, name: str, header: list[str], rows: list[list[str]]) -> None:
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(header)
+        writer.writerows(rows)
+        path = root / "landing" / "mes_production" / arrival.replace("-", "/") / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(buf.getvalue(), encoding="utf-8")
+
+    v1 = [
+        [
+            rnd.choice(ids + ["", " F1 "]),
+            rnd.choice(revs),
+            v1_time(),
+            rnd.choice(stations),
+            rnd.choice("ABCabcD1"),
+            "L1",
+            rnd.choice(skus),
+            rnd.choice(qtys),
+            "op1",
+            "",
+        ]
+        for _ in range(n // 2)
+    ]
+    v2 = [
+        [
+            rnd.choice(ids),
+            rnd.choice(revs),
+            v2_time(),
+            rnd.choice(stations),
+            rnd.choice(["1", "2", "3", "C", "4", ""]),
+            "L1",
+            rnd.choice(skus),
+            rnd.choice(qtys),
+            rnd.choice(["EA", "ea", "BX", ""]),
+            "op1",
+            "",
+        ]
+        for _ in range(n // 2)
+    ]
+    write(
+        "2025-06-16",
+        "mes_production_20250615.csv",
+        [
+            "event_id",
+            "rev",
+            "event_time",
+            "station",
+            "shift",
+            "lot",
+            "sku",
+            "qty",
+            "operator",
+            "comment",
+        ],
+        v1,
+    )
+    write(
+        "2025-11-03",
+        "mes_production_20251102.csv",
+        [
+            "event_id",
+            "revision",
+            "event_ts_utc",
+            "station_code",
+            "shift_code",
+            "lot_id",
+            "item_code",
+            "quantity",
+            "uom",
+            "operator_id",
+            "comment",
+        ],
+        v2,
+    )
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_glue_transform_matches_duckdb_on_fuzzed_records(spark, job, tmp_path, seed):
+    _fuzz_landing(tmp_path, seed)
+    run_pipeline(tmp_path / "landing", tmp_path / "lake")
+    assert _compare(spark, job, tmp_path / "lake") > 0
