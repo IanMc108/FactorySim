@@ -108,6 +108,13 @@
         "exceptions": 30,
         "with_evidence": 24
       },
+      "file_version_revert": {
+        "rows": 0,
+        "matched": 0,
+        "open": 0,
+        "exceptions": 0,
+        "with_evidence": 0
+      },
       "file_version_shrink": {
         "rows": 23,
         "matched": 23,
@@ -148,6 +155,13 @@
         "matched": 136,
         "open": 0,
         "exceptions": 6,
+        "with_evidence": 0
+      },
+      "unreferenced_bank_lines": {
+        "rows": 0,
+        "matched": 0,
+        "open": 0,
+        "exceptions": 0,
         "with_evidence": 0
       }
     }

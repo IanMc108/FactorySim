@@ -106,14 +106,16 @@ One year of exports: 1,673 files and 24,631 records. The pipeline loaded 1,650 f
 | `bank_balance_continuity` | 519 | 519 | 0 | 0 | 0 |
 | `credit_memo_references` | 4 | 4 | 0 | 0 | 0 |
 | `customer_receipts` | 365 | 334 | 1 | 30 | 24 |
+| `file_version_revert` | 0 | 0 | 0 | 0 | 0 |
 | `file_version_shrink` | 23 | 23 | 0 | 0 | 0 |
 | `inventory_roll_forward` | 156 | 156 | 0 | 0 | 0 |
 | `maintenance_payments` | 12 | 12 | 0 | 0 | 0 |
 | `mass_balance` | 2,190 | 2,158 | 0 | 32 | 26 |
 | `production_vs_sales` | 1,460 | 1,408 | 1 | 51 | 40 |
 | `supplier_payments` | 142 | 136 | 0 | 6 | 0 |
+| `unreferenced_bank_lines` | 0 | 0 | 0 | 0 | 0 |
 
-Every one of the 119 exceptions is accounted for: 30 rows are injected business errors (caught; 0 more were still inside the late-arrival window at the end of the year), and the rest are injected lost records, each flagged with the quarantined record attached (92 of 92 rows touched by a lost record). Exceptions with no injected cause: 0. Business-error rows that also carry quarantine evidence from the same day, where an analyst has to look past it: 1.
+All 119 exceptions trace back to an injected defect; 0 have no injected cause. Injected business errors: 30 rows are exceptions and 0 more were still inside the late-arrival window at the end of the year. Injected lost records: 92 of the 92 rows they touch are raised (as exceptions, or as open if recent) with the lost record attached as evidence. Business-error rows that also carry quarantine evidence from the same day, where an analyst has to look past it: 1.
 
 **Gold vs. ground truth** (cells compared against the simulator's database):
 
@@ -141,6 +143,8 @@ Every one of the 119 exceptions is accounted for: 30 rows are injected business 
 | 7 | 1 | 0 | – | – | 390 / 390 | 100% / 100% | 30 (+0) / 30 | 92 / 92 | 0 | 0 |
 | 8 | 1 | 0 | – | – | 402 / 402 | 100% / 100% | 27 (+0) / 27 | 103 / 103 | 0 | 0 |
 | 7 | 54 | 44 | 0 | 13 | 390 / 390 | 100% / 100% | 30 (+0) / 30 | 92 / 92 | 0 | 0 |
+
+Alarms raised then cleared are exceptions that a later batch closes: for example a duplicate invoice whose reversing credit memo arrives more than 7 days later (the exporter delays credit memos by up to 10 days). Until it arrives, the duplicate is a real over-billing, so the alarm is correct; how many occur depends on the seed.
 
 <!-- etl:end -->
 
