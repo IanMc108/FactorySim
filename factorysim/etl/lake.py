@@ -73,6 +73,13 @@ def atomic_copy(conn: duckdb.DuckDBPyConnection, select_sql: str, target: Path) 
     os.replace(tmp, target)
 
 
+# The order of a file name's versions, newest first. One arrival folder holds one path per
+# file name, so within a folder the latest log entry (by sequence) is what is on disk now,
+# even after an overwrite by a copy with an older modification time. Used by everything
+# that ranks versions, so the current version and the shrink/revert checks always agree.
+VERSION_ORDER = "arrival_date DESC, seq DESC"
+
+
 class Lake:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -123,13 +130,13 @@ class Lake:
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
     def watermark(self, conn: duckdb.DuckDBPyConnection) -> date | None:
-        """Latest arrival date of any file the pipeline has seen."""
+        """Latest arrival date of any file the pipeline accepted (never a rejected one)."""
         glob = self._log_glob()
         if not glob:
             return None
         return conn.execute(
             f"SELECT max(arrival_date) FROM read_parquet('{glob}', hive_partitioning = false, "
-            "union_by_name = true) WHERE status <> 'rejected'"
+            "union_by_name = true) WHERE status IN ('loaded', 'duplicate_content', 'touched')"
         ).fetchone()[0]
 
     def next_batch_id(self) -> str:
@@ -165,6 +172,36 @@ class Lake:
         )
         atomic_write_table(table, target)
 
+    def lost_versions(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
+        """Current file versions whose bronze file is missing (after ingest has rebuilt what
+        it could from the landing zone): their records are no longer in silver."""
+        present = set((self.root / "bronze").glob("*/*/*.parquet"))
+        current = {
+            (s, n, h) for s, n, h in conn.execute("SELECT * FROM current_versions").fetchall()
+        }
+        return sorted(
+            r["file"]
+            for r in self.ingest_log(conn)
+            if r["status"] == "loaded"
+            and (r["source"], Path(r["file"]).name, r["sha256"]) in current
+            and self.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
+            not in present
+        )
+
+    def repair_ingest_log(self) -> None:
+        """Finish a compaction that crashed after writing batch.parquet but before removing
+        the per-file entries it replaced, so no entry is ever counted twice."""
+        for batch_dir in sorted((self.root / "_control" / "ingest_log").glob("batch_id=*")):
+            compacted = batch_dir / "batch.parquet"
+            leftovers = [p for p in batch_dir.glob("*.parquet") if p != compacted]
+            if not leftovers or not compacted.exists():
+                continue
+            done = set(pq.read_table(compacted, columns=["seq"]).column("seq").to_pylist())
+            for p in leftovers:
+                if set(pq.read_table(p, columns=["seq"]).column("seq").to_pylist()) <= done:
+                    p.unlink()
+            self.compact_ingest_log(batch_dir.name.removeprefix("batch_id="))
+
     def compact_ingest_log(self, batch_id: str) -> None:
         """Merge a batch's per-file log entries into one file (they stay valid if we crash)."""
         batch_dir = self.root / "_control" / "ingest_log" / f"batch_id={batch_id}"
@@ -182,10 +219,8 @@ class Lake:
     def current_versions(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Create temp table current_versions(source, file_name, sha256) from the log.
 
-        The current version of a file name is its loaded or duplicate entry with the latest
-        arrival date, then the latest ingest sequence. One arrival folder holds one path per
-        file name, so within a folder the latest log entry is what is on disk now, even if
-        the file was overwritten by a copy with an older modification time.
+        The current version of a file name is its loaded or duplicate entry that comes first
+        in VERSION_ORDER.
         """
         glob = self._log_glob()
         source = (
@@ -202,7 +237,7 @@ class Lake:
                 WHERE status IN ('loaded', 'duplicate_content')
                 QUALIFY row_number() OVER (
                     PARTITION BY source, regexp_extract(file, '[^/]+$')
-                    ORDER BY arrival_date DESC, seq DESC) = 1"""
+                    ORDER BY {VERSION_ORDER}) = 1"""
         )
 
     def file_versions(self, conn: duckdb.DuckDBPyConnection) -> None:
@@ -213,7 +248,8 @@ class Lake:
                 """CREATE OR REPLACE TEMP VIEW file_versions AS
                    SELECT NULL::VARCHAR AS source, NULL::VARCHAR AS file_name,
                           NULL::DATE AS file_business_date, NULL::BIGINT AS versions,
-                          NULL::BIGINT AS current_records, NULL::BIGINT AS max_earlier_records
+                          NULL::BIGINT AS current_records, NULL::BIGINT AS max_earlier_records,
+                          NULL::BOOLEAN AS reverted
                    WHERE false"""
             )
             return
@@ -229,19 +265,27 @@ class Lake:
                     FROM log WHERE status = 'loaded' GROUP BY ALL
                 ),
                 ranked AS (
-                    SELECT l.source, l.file_name, l.file_business_date, c.records,
+                    SELECT l.source, l.file_name, l.file_business_date, l.sha256, c.records,
                            row_number() OVER (
-                               PARTITION BY l.source, l.file_name
-                               ORDER BY l.arrival_date DESC, l.arrival_ts DESC NULLS LAST,
-                                        l.seq DESC) AS rn,
+                               PARTITION BY l.source, l.file_name ORDER BY {VERSION_ORDER}
+                           ) AS rn,
                            count(*) OVER (PARTITION BY l.source, l.file_name) AS versions
                     FROM log l JOIN content c USING (source, file_name, sha256)
-                )
-                SELECT source, file_name, any_value(file_business_date) AS file_business_date,
-                       max(versions) AS versions,
-                       max(records) FILTER (WHERE rn = 1) AS current_records,
-                       coalesce(max(records) FILTER (WHERE rn > 1), 0) AS max_earlier_records
-                FROM ranked GROUP BY source, file_name"""
+                ),
+                current AS (SELECT source, file_name, sha256 FROM ranked WHERE rn = 1)
+                SELECT r.source, r.file_name,
+                       any_value(r.file_business_date) AS file_business_date,
+                       max(r.versions) AS versions,
+                       max(r.records) FILTER (WHERE r.rn = 1) AS current_records,
+                       coalesce(max(r.records) FILTER (WHERE r.rn > 1), 0) AS max_earlier_records,
+                       -- A revert: the current content had been replaced by different content
+                       -- before it came back (A, B, then A again, e.g. a stale re-send). rn
+                       -- grows with age, so some copy of A is older than the newest non-A.
+                       coalesce(min(r.rn) FILTER (WHERE r.sha256 <> cur.sha256)
+                                < max(r.rn) FILTER (WHERE r.rn > 1 AND r.sha256 = cur.sha256),
+                                false) AS reverted
+                FROM ranked r JOIN current cur USING (source, file_name)
+                GROUP BY r.source, r.file_name"""
         )
 
     def recover_orphan_bronze(self, conn: duckdb.DuckDBPyConnection) -> set[Path]:
@@ -252,6 +296,7 @@ class Lake:
         is rebuilt from the file itself. A file without readable metadata is moved to
         ``_orphaned/`` for a person to look at. Returns the bronze files now in the log.
         """
+        self.repair_ingest_log()
         expected = {
             self.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
             for r in self.ingest_log(conn)

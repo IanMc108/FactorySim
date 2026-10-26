@@ -21,7 +21,7 @@ flowchart LR
     bronze --> silver["Silver<br/>typed, conformed, deduplicated"]
     bronze --> quarantine["Quarantine<br/>reason-coded rejects"]
     silver --> gold["Gold facts"]
-    gold --> recon["Reconciliation<br/>10 checks"]
+    gold --> recon["Reconciliation<br/>11 checks"]
     quarantine --> recon
     gold -.-> eval{{"Evaluator"}}
     manifest -.-> eval
@@ -151,10 +151,10 @@ Every one of the 119 exceptions is accounted for: 30 rows are injected business 
   - a re-delivered copy is not stored again;
   - a correction, a revert to an earlier version, and a header-only re-issue that withdraws every record all behave the same in incremental and full runs;
   - records from different files are ordered by arrival folder and then arrival time, so a re-extract that lands in the same folder after a run wins in incremental and full runs alike;
-  - a re-issue with fewer records than an earlier version is raised for a person to confirm;
-  - a file that cannot be used (bad name, undecodable bytes, empty, no header, or an arrival date before its business date or more than 60 days after it) is logged as rejected while the rest of the batch carries on, and does not move the late-arrival window.
+  - a re-issue with fewer records than an earlier version, or a revert to content that had already been replaced (a stale re-send after a correction looks exactly like that), is raised for a person to confirm;
+  - a file that cannot be used (bad name or folder, an arrival date before its business date or more than 60 days after it, undecodable bytes, an empty CSV or no header) is logged as rejected while the rest of the batch carries on, and does not move the late-arrival window. The name and date rules come first, so even a byte-identical copy of a good file in a mis-typed folder is rejected.
 
-  Unchanged files are skipped by size, modification time and change time without being read. **Bronze is never deleted:** each bronze file carries its ingest metadata, so a crash between writing it and logging it, or a lost ingest log, is repaired from bronze itself, and lost bronze is rebuilt from the landing zone. A lock file stops two runs from sharing a lake.
+  Unchanged files are skipped by size, modification time and change time without being read. **Bronze is never deleted:** each bronze file carries its ingest metadata, so a crash between writing it and logging it, or a lost ingest log, is repaired from bronze itself, and lost bronze is rebuilt from the landing zone (or reported, if the landing file has expired too). A lock file stops two runs from sharing a lake.
 - **Incremental and idempotent.** Each run recomputes silver from bronze, fingerprints every monthly partition and rewrites only the months whose content changed. It also deletes months left empty, so a correction that moves a record from May to June fixes both months. Gold and reconciliation are small and are rebuilt in full. Tests run the year in uneven batches and compare against one full run, and re-running with no new files changes nothing.
 - **Deduplication removes copies, not transactions.** Records with the same natural key collapse to the highest revision where the feed has one, then the newest extract, then the file that landed last. A credit memo that reverses a duplicate invoice stays, and a billing error surfaces in reconciliation rather than being silently "fixed".
 - **Quarantine instead of drop or guess.** Every rejected record keeps its raw text and gets a reason code. Values are parsed strictly in both DuckDB and Spark:
@@ -163,8 +163,8 @@ Every one of the 119 exceptions is accounted for: 30 rows are injected business 
   - a plant-local time inside the spring-forward gap, or in the repeated fall-back hour, is quarantined rather than assigned a guessed instant;
   - unparseable, negative or missing amounts and currencies are rejected, not read as 0.
 - **Every variance is raised; quarantine is evidence, never an excuse.** A reconciliation row is *matched* (variance 0), *open* (within 7 days of the latest arrival, because late files may still come) or an *exception*. Nothing clears a row automatically. Each row lists the quarantined records that might relate to it (same station, SKU or reference, or a key that could not be recovered, dated in the row's window), so whoever triages it starts with the likely cause. A quarantined record stops being listed once a corrected copy of it loads (not an older revision), and it is dated by its own date, not its file's.
-- **Every bank line is accounted for.** Balances are checked line by line, including each statement's `BALANCE FORWARD`, and a line that is neither a customer deposit nor references a PO or work order is an exception.
-- **Runs report what changed.** Each run lists the exceptions that are new or cleared since the previous one. `factorysim etl` exits with status 3 if any file was rejected, and with 2 on new exceptions when given `--fail-on-new-exceptions`, so a scheduler can alert.
+- **Every bank line is accounted for.** Balances are checked line by line in statement order, including each statement's `BALANCE FORWARD`, and a line that is neither a customer deposit nor references a PO or work order is an exception (a `BALANCE FORWARD` line counts as an opening balance only if it moves no money).
+- **Runs report what changed.** Each run lists the exceptions that are new or cleared since the previous one. `factorysim etl` exits with status 3 while any landed file stands rejected or a file version is lost (a retry fails again until it is fixed), and with 2 on new exceptions (`--fail-on-new-exceptions`) or any outstanding exception (`--fail-on-exceptions`), so a scheduler can alert.
 - **Time is explicit.** Plant-local MES timestamps (America/Chicago, DST included) are converted to UTC, and post-midnight night-shift events belong to the production day the shift started on.
 - **Transformations are SQL-first.** The SQL lives in versioned [`.sql` files](factorysim/etl/sql/), and Python only handles ingestion and orchestration.
 

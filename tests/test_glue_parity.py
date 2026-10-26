@@ -170,9 +170,12 @@ def _fuzz_landing(root: Path, seed: int, n: int = 300) -> None:
 
     rnd = random.Random(seed)
     ids = [f"F{i}" for i in range(n // 3)]  # shared ids exercise dedup and revisions
-    stations = ["LITHO-A", "lith-a", " CHEM-B ", "EPC-A", "LITHO-Z", ""]
+    # Unicode spaces (NBSP, em space, narrow NBSP) are common in spreadsheet exports, and
+    # trim() differs between the engines unless the job handles them.
+    stations = ["LITHO-A", "lith-a", " CHEM-B ", "EPC-A", "LITHO-Z", "", "LITHO-A\u00a0"]
     skus = ["MPU-XL-A", "mpuxl-b", " SUB-PE", "MESH-AIN", "MPU-XL-SCRAP", ""]
     qtys = ["5", "0", "-3", "10.5", "1e3", " 7 ", "007", "", "1_000", "12", "10\n", "\t5", "5\r"]
+    qtys += ["\u00a010", "10\u2003", "\u202f4\u00a0\n", "\u00a0"]
     revs = ["1", "2", "3", "1.0", " 2", "x", "", "1\n"]
 
     def v1_time() -> str:
@@ -197,11 +200,11 @@ def _fuzz_landing(root: Path, seed: int, n: int = 300) -> None:
 
     v1 = [
         [
-            rnd.choice(ids + ["", " F1 "]),
+            rnd.choice(ids + ["", " F1 ", "\u00a0", "\u2003F2"]),
             rnd.choice(revs),
             v1_time(),
             rnd.choice(stations),
-            rnd.choice("ABCabcD1"),
+            rnd.choice([*"ABCabcD1", "B\u00a0"]),
             "L1",
             rnd.choice(skus),
             rnd.choice(qtys),

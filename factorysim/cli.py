@@ -73,6 +73,8 @@ def _etl(landing: Path, lake: Path, through: date | None):
     )
     for file, error in s.rejected_files:
         print(f"  REJECTED {file}: {error}")
+    for file in s.lost_files:
+        print(f"  LOST {file}: bronze and landing file are both gone; its records left silver")
     return s
 
 
@@ -144,7 +146,13 @@ def main(argv: list[str] | None = None) -> None:
     etl.add_argument(
         "--fail-on-new-exceptions",
         action="store_true",
-        help="exit 2 if this run raised exceptions the previous run did not have",
+        help="exit 2 if this run raised exceptions the previous run did not have "
+        "(edge-triggered: a retry of the same run exits 0)",
+    )
+    etl.add_argument(
+        "--fail-on-exceptions",
+        action="store_true",
+        help="exit 2 while any reconciliation exception is outstanding (level-triggered)",
     )
     etl.add_argument(
         "--through",
@@ -195,10 +203,14 @@ def main(argv: list[str] | None = None) -> None:
         _export(args.build, args.seed, args.defect_seed)
     elif args.command == "etl":
         summary = _etl(args.landing, args.lake, args.through)
-        if args.fail_on_new_exceptions and summary.changes["new_exceptions"]:
-            raise SystemExit(2)
-        if summary.rejected_files:
+        # Data problems first: they stay until the files are fixed, so a retry fails again.
+        if summary.rejected_files or summary.lost_files:
             raise SystemExit(3)
+        exceptions = sum(r["exceptions"] for r in summary.recon.values())
+        if (args.fail_on_new_exceptions and summary.changes["new_exceptions"]) or (
+            args.fail_on_exceptions and exceptions
+        ):
+            raise SystemExit(2)
     elif args.command == "evaluate":
         results = _evaluate(args.build)
         if args.json:

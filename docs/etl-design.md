@@ -35,23 +35,26 @@ Bronze is partitioned by **arrival** date, because that is when the pipeline lea
 
 Each `factorysim etl [--through DATE]` run does the following:
 
-1. **Lock and recover.** Take `_control/run.lock`, or refuse to run. **Bronze is never deleted.** Every bronze file carries its own ingest metadata (feed, file, SHA-256, arrival date and time, sequence, size, modification and change times) in its Parquet footer. A bronze file without a log entry, left by a crash between writing it and logging it or by a lost control table, has its log entry rebuilt from that metadata. A file without readable metadata is moved to `_orphaned/` for a person. A logged bronze file that has gone missing is treated as never loaded, so it is rebuilt from the landing zone. Bronze is listed once for all of this.
+1. **Lock and recover.** Take `_control/run.lock`, or refuse to run. **Bronze is never deleted.** Every bronze file carries its own ingest metadata (feed, file, SHA-256, arrival date and time, sequence, size, modification and change times) in its Parquet footer. A bronze file without a log entry, left by a crash between writing it and logging it or by a lost control table, has its log entry rebuilt from that metadata. A file without readable metadata is moved to `_orphaned/` for a person. A logged bronze file that has gone missing is treated as never loaded, so it is rebuilt from the landing zone; if the landing file is gone too (an S3 lifecycle rule), the run reports it as lost. A log compaction that crashed half-way (step 3) is finished first, so no log entry is counted twice. Bronze is listed once for all of this.
 2. **Discover** landed files (optionally only those with arrival date ≤ `--through`), in arrival order: arrival folder, then the file's modification time (its arrival time; on S3, `LastModified`). Marker files (`_SUCCESS`, dotfiles) are ignored.
 3. **Ingest** each arrival and commit it before moving on:
 
    | Case | Outcome |
    |---|---|
    | Same path, same size, modification time and change time as its last entry | Skipped without reading the file |
+   | Name or folder that breaks the convention, or an arrival before the file's business date or more than 60 days after it | Logged `rejected`, whatever the content: a byte-identical copy of a good file in a mis-typed folder is rejected like anything else there |
    | Same path, same SHA-256 as its last entry | Logged `touched` (new size/mtime, so the next run skips the read) |
    | Content already loaded under this file name | Logged `duplicate_content` and not stored again (a re-delivery, or a revert) |
-   | Name or folder that breaks the convention; an arrival before the file's business date or more than 60 days after it; bytes that decode as neither UTF-8 nor Windows-1252; an empty file or a missing header | Logged `rejected` with the error; the batch carries on, and the file does not count towards the latest arrival |
+   | Bytes that decode as neither UTF-8 nor Windows-1252; an empty CSV or a missing header | Logged `rejected` with the error; the batch carries on |
+
+   Rejected files never count towards the latest arrival. An empty JSON-lines file is not an error: it has no header, so it is how a quiet day, or a re-issue that withdraws a day, is delivered.
    | Anything else | Split into records and written to bronze with lineage |
 
    The change time catches a same-size correction copied with its old modification time preserved (`cp -p`, `rsync -t`).
 
    Records that do not split into the header's columns are kept with `_parse_error`; a short row also keeps its leading columns by position. Repeated header lines are dropped. At the end of the batch, its per-file log entries are compacted into one file.
 
-   The **current version** of each file name is then read from the log: the `loaded` or `duplicate_content` entry with the latest arrival date, then the latest sequence. One arrival folder holds one path per file name, so within a folder the latest log entry is what is on disk now, even after an overwrite by a copy with an older modification time. Silver only sees that version's records. This one rule handles in-place overwrites, re-sends, reverts (A→B→A), header-only re-issues that withdraw every record, and versions that land in an earlier arrival folder, identically in incremental and full runs. Records with the same key in *different* files are ordered by arrival folder and then arrival time (step 4), which comes from the files, not from when a run happened to see them: a re-extract that lands in the same folder after a run wins in both. A version with fewer records than an earlier one is raised by the `file_version_shrink` check.
+   The **current version** of each file name is then read from the log: the `loaded` or `duplicate_content` entry with the latest arrival date, then the latest sequence. One arrival folder holds one path per file name, so within a folder the latest log entry is what is on disk now, even after an overwrite by a copy with an older modification time. The same order (`VERSION_ORDER` in `lake.py`) ranks versions everywhere, so the version silver uses is the one the file-version checks compare. Silver only sees that version's records. This one rule handles in-place overwrites, re-sends, reverts (A→B→A), header-only re-issues that withdraw every record, and versions that land in an earlier arrival folder, identically in incremental and full runs. Records with the same key in *different* files are ordered by arrival folder and then arrival time (step 4), which comes from the files, not from when a run happened to see them: a re-extract that lands in the same folder after a run wins in both. A version with fewer records than an earlier one is raised by the `file_version_shrink` check, and a revert to content that had already been replaced (A→B→A, which is also what a stale re-send after a correction looks like) by `file_version_revert`.
 4. **Silver.** For each entity:
    - keep only the records of each file name's current version;
    - run the entity's SQL to type, conform and validate every record;
@@ -60,7 +63,9 @@ Each `factorysim etl [--through DATE]` run does the following:
 5. **Gold.** Read silver and quarantine back *from the lake* and rebuild the facts, the reconciliation tables and the DQ summary. Compare the new reconciliation with the previous run's (`recon_changes`): which exceptions are new and which cleared.
 6. **Catalog.** Recreate `catalog.duckdb` with views over every table.
 
-`factorysim etl` prints the rejected files and the new and cleared exceptions, and exits with status 3 if any file was rejected, or 2 with `--fail-on-new-exceptions` if there are new exceptions, so a scheduler can alert on either.
+`factorysim etl` prints rejected and lost files and the new and cleared exceptions. Its exit status, for a scheduler:
+- **3** while any landed file stands rejected (its latest log entry is a rejection) or a current file version is lost. This is level-triggered: a retry fails again until the file is fixed or removed, and it takes precedence over 2.
+- **2** with `--fail-on-new-exceptions` if this run raised exceptions the previous run did not have. This is edge-triggered, so a retry of the same run exits 0; `--fail-on-exceptions` exits 2 while any exception is outstanding.
 
 **Why recompute silver from all of bronze?** Deduplication and "latest wins" need every version of a key, and a correction can move a record to another month: the first version of this pipeline only rewrote the months its new records fell in, and left a stale copy behind in the old month. Fingerprinting every month makes the write set exactly the months whose content changed, so there is no "touched months" logic to get wrong. The cost is reading all of bronze on every run (see *Scale and cost*).
 
@@ -111,14 +116,15 @@ Every check returns `(business_date, key, expected, actual)`, and one wrapper as
 | `supplier_payments` | goods-receipt value per PO (all partial deliveries) | bank payments for the PO from the first delivery to 3 days after the last | unpaid, double-paid or late-paid receipts, UoM errors; payments outside the window get their own row |
 | `maintenance_payments` | work-order cost | bank payments for the WO within 3 days | duplicate or missing completions, double or late payments |
 | `inventory_roll_forward` | previous snapshot + receipts − issues | snapshot | lost receipts or issues, UoM errors |
-| `bank_balance_continuity` | previous balance + amount, per line, including each `BALANCE FORWARD` | reported balance | missing, duplicated or corrupted statement lines; a statement that does not carry the previous close forward |
-| `unreferenced_bank_lines` | 0 | the amount of a line that is neither a deposit nor references a PO or work order | cash nobody can account for (a fraudulent or misdirected debit) |
+| `bank_balance_continuity` | previous balance + amount, per line in statement order (a back-valued line stays where the bank printed it), including each `BALANCE FORWARD` | reported balance | missing, duplicated or corrupted statement lines; a statement that does not carry the previous close forward |
+| `unreferenced_bank_lines` | 0 | the amount of a line that is neither a deposit nor references a PO or work order | cash nobody can account for (a fraudulent or misdirected debit or credit). Only a `BALANCE FORWARD` line that moves no money is an opening balance; one with a debit or credit lands here |
 | `credit_memo_references` | the referenced invoice exists | count found | credit memos for invoices that do not exist |
 | `file_version_shrink` | the largest earlier record count of a file name | the current version's count | a re-issue that withdraws data (deliberate or not, a person confirms it) |
+| `file_version_revert` | 0 | 1 if the current version's content had already been replaced by different content | a stale re-send that undoes a correction, or a deliberate rollback (a person confirms it) |
 
 Bank rows are keyed by statement file and line (`bank_statement_20250304.csv#3: ...`), so a row keeps its key from run to run and `recon_changes` can track it.
 
-**Evidence.** Each check's header in `sql/gold/recon_checks.sql` declares which feeds can affect it and how rows match (station, SKU, material, reference, or any). Every row carries `candidate_records` and `candidates`: the quarantined records from those feeds, dated in the row's window, whose key matches or could not be recovered. [`sql/gold/quarantine_facts.sql`](../factorysim/etl/sql/gold/quarantine_facts.sql) recovers from each quarantined record:
+**Evidence.** Each check's header in `sql/gold/recon_checks.sql` declares which feeds can affect it and how rows match (station, SKU, material, reference, or any). Every row carries `candidate_records` and `candidates`: the quarantined records from those feeds, dated in the row's window, whose key matches or could not be recovered. The window runs from `window_start` (or the row's date) to the row's date, or to the column a check names with `evidence_until`: the payment checks use it so that a quarantined payment made within the terms is attached to its PO or work order. [`sql/gold/quarantine_facts.sql`](../factorysim/etl/sql/gold/quarantine_facts.sql) recovers from each quarantined record:
 - **its key and its own business date**, so a back-dated line in a July file counts for June;
 - **whether it has been released**: a record with the same natural key has since loaded into silver from the same or a newer extract and, where both carry one, the same or a higher MES revision. A released record is a corrected re-send; it is no longer offered as evidence. A quarantined revision 2 is *not* released by a revision 1 that is already in silver.
 
@@ -143,7 +149,7 @@ On Glue, a job bookmark over bronze only tells the job *whether* new files arriv
 2. recomputes silver from the whole bronze prefix;
 3. syncs partitions by month fingerprint, as locally, because a correction can move a record to a month that no new file mentions.
 
-Spark runs with `timeParserPolicy=CORRECTED`, and an empty bookmark batch is skipped. `tests/test_glue_parity.py` checks the Spark transform against the DuckDB output row for row, on three kinds of input:
+Spark runs with `timeParserPolicy=CORRECTED`, and an empty bookmark batch is skipped. The engines differ in small ways that the job has to undo: Spark's `trim` strips only ASCII spaces where DuckDB's strips every Unicode space separator (NBSP, em space, ...), and Java's `$` matches before a trailing newline, so the job trims with an explicit `\p{Zs}` pattern and anchors with `\A...\z`. `tests/test_glue_parity.py` checks the Spark transform against the DuckDB output row for row, on three kinds of input:
 - a generated half-year;
 - hand-made hostile records (fractional quantities, `1e3`, fractional-second timestamps, legacy codes, DST nights, a correction that changes month);
 - three seeded batches of fuzzed records.
@@ -159,7 +165,7 @@ The data here is about 25k records a year. Three things would change at producti
 - **Ingestion is cheap; silver is O(history).** Ingestion skips unchanged landing files by size, modification and change time (on S3, the ETag), so a no-op run reads no landing data. Every run still reads all of bronze to recompute silver, so the cost of a daily run grows with history. Fixes, in order of preference:
   1. move silver to Iceberg (or Delta/Hudi) and `MERGE` changed keys, using a key-to-partition index instead of a full recompute;
   2. or bound corrections to a lookback window (for example 35 days of arrivals), with older corrections going through an explicit backfill.
-- **Bronze is one small Parquet file per landed file** (1,651 files, a few KB each), which is the classic small-files problem on S3. A daily compaction job should merge each arrival partition, keeping the ingest log as the source of file identity.
+- **Bronze is one small Parquet file per landed file** (about 1,650 a year, a few KB each), which is the classic small-files problem on S3. A compaction job could merge each arrival partition, but not as things stand: recovery (run model, step 1) finds a bronze file by its path and reads its ingest metadata from that file's footer, so a merged file would look like an orphan and its originals like lost bronze. Compaction needs a table format (Iceberg keeps a manifest of data files) or a recovery step that reads the per-record lineage columns instead.
 - **Bronze stores each record as JSON text.** That keeps bronze schema-agnostic across the MES schema change and malformed rows (raw text is now kept only for records that failed to parse). The price is that queries on bronze parse JSON. At scale, a typed bronze per feed and schema version (or a VARIANT/struct column) would be cheaper to query.
 
 ## What I would add next

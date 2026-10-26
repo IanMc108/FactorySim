@@ -59,7 +59,8 @@ ORDER BY work_order;
 
 -- table: fct_bank_transactions
 SELECT
-    row_number() OVER (ORDER BY txn_date, _file, _record_number) AS line_seq,
+    -- statement order: a back-valued line printed on a later statement stays where it is
+    row_number() OVER (ORDER BY _file_business_date, _file, _record_number) AS line_seq,
     -- stable across runs, unlike line_seq: the statement file and line it came from
     regexp_extract(_file, '[^/]+$') || '#' || _record_number AS source_line,
     txn_date, txn_kind, reference, description,

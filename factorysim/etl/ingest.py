@@ -8,24 +8,29 @@ number in the file. Records that cannot be split into the header's columns are k
 
 Every arrival of a file is an event in the ingest log:
 
-* a path whose size and modification time match its last log entry is skipped without
-  being read (a re-run), and so is a path whose content hash matches its last entry;
+* a path whose size, modification and change times match its last log entry is skipped
+  without being read (a re-run);
+* a file with a bad name or folder, or an arrival date before its business date or more
+  than 60 days after it, is logged as ``rejected`` whatever its content;
+* a path whose content hash matches its last entry is logged as ``touched``;
 * content already loaded under the same file name (a re-delivery, or a revert to an
   earlier version) is logged as ``duplicate_content`` and not stored again;
 * new content is decoded, split into records and written to bronze as ``loaded``;
-* a file that cannot be read (bad name, undecodable bytes) is logged as ``rejected``
-  and the rest of the batch carries on. Marker files such as ``_SUCCESS`` are ignored.
+* a file that cannot be read (undecodable bytes, an empty CSV, no header) is logged as
+  ``rejected`` and the rest of the batch carries on. Marker files such as ``_SUCCESS``
+  are ignored.
 
 Which version of a file name is *current* is decided from the log, not from bronze: the
-loaded or duplicate entry with the latest arrival date (then the latest ingest sequence).
+loaded or duplicate entry with the latest arrival date, then the latest ingest sequence.
 So a revert, a header-only re-issue that withdraws every record, and a version that lands
 in an earlier arrival folder are all handled the same way in incremental and full runs.
 
 Each file is committed on its own: its bronze Parquet is written to a temporary name and
-renamed, then its ingest-log entry is written the same way. A crash between the two leaves
-an orphan bronze file, which the next run deletes before doing anything else; a logged
-bronze file that has gone missing is rebuilt from the landing zone. At the end of a batch
-its per-file log entries are compacted into one file.
+renamed, then its ingest-log entry is written the same way. Bronze is never deleted. Every
+bronze file carries its ingest metadata, so a crash between the two writes (or a lost log)
+is repaired by rebuilding the log entry from the bronze file; a logged bronze file that has
+gone missing is rebuilt from the landing zone, or reported if the landing file is gone too.
+At the end of a batch its per-file log entries are compacted into one file.
 """
 
 from __future__ import annotations
@@ -212,8 +217,8 @@ def _parse_csv(text: str) -> tuple[list[tuple], int, int]:
 
 
 def _parse_jsonl(text: str) -> tuple[list[tuple], int, int]:
-    if not text.strip():
-        raise UnreadableFile("empty file")
+    # JSON lines have no header, so an empty file is a valid "no records" extract (a quiet
+    # day, or a re-issue that withdraws a day); file_version_shrink raises the latter.
     rows, errors = [], 0
     # Split on "\n" only: str.splitlines() would also break on U+2028 and friends, which
     # are legal inside JSON strings.
@@ -315,31 +320,27 @@ def ingest(
         payload = f.path.read_bytes()
         sha = hashlib.sha256(payload).hexdigest()
         seq, next_seq = next_seq, next_seq + 1
-        if last and last["sha256"] == sha and sha not in lost:
-            # Same content, new stamp: record it so the next run skips the read.
-            result = IngestResult(f, sha, seq, "touched", "", 0, 0, 0)
-        elif (f.source, f.name, sha) in loaded:
-            result = IngestResult(f, sha, seq, "duplicate_content", "", 0, 0, 0)
-        elif f.arrival_date is None or f.business_date is None:
-            result = IngestResult(
-                f, sha, seq, "rejected", "", 0, 0, 0, "unrecognized landing path or file name"
-            )
+        # The path and date rules come first, so a copy of good content in a bad place is
+        # rejected like anything else there (it must not count as a duplicate or a touch).
+        if f.arrival_date is None or f.business_date is None:
+            problem = "unrecognized landing path or file name"
         elif not (
             f.business_date
             <= f.arrival_date
             <= f.business_date + timedelta(days=MAX_ARRIVAL_DELAY_DAYS)
         ):
-            result = IngestResult(
-                f,
-                sha,
-                seq,
-                "rejected",
-                "",
-                0,
-                0,
-                0,
-                f"implausible arrival date {f.arrival_date} for business date {f.business_date}",
+            problem = (
+                f"implausible arrival date {f.arrival_date} for business date {f.business_date}"
             )
+        else:
+            problem = None
+        if problem:
+            result = IngestResult(f, sha, seq, "rejected", "", 0, 0, 0, problem)
+        elif last and last["sha256"] == sha and sha not in lost:
+            # Same content, new stamp: record it so the next run skips the read.
+            result = IngestResult(f, sha, seq, "touched", "", 0, 0, 0)
+        elif (f.source, f.name, sha) in loaded:
+            result = IngestResult(f, sha, seq, "duplicate_content", "", 0, 0, 0)
         else:
             try:
                 text, encoding = _decode(payload)
