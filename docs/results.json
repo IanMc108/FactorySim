@@ -1,0 +1,539 @@
+{
+  "config": {
+    "days": 365,
+    "seed": 42,
+    "maintenance_interval_days": 30,
+    "maintenance_cost": 5000.0,
+    "decay_onset_days": 15,
+    "decay_rate_pp": 1.0,
+    "decay_family": "Microprocessor XL",
+    "opening_cash": 100000.0
+  },
+  "table_seeds": 200,
+  "sweep_seeds": 50,
+  "model": {
+    "revenue_per_day_no_decay": 308400.0,
+    "grade_a_units_per_day": 210.0,
+    "loss_per_pp_day": 3000.0,
+    "optimal_interval": 15,
+    "cost_per_day": {
+      "1": 5000.0,
+      "2": 2500.0,
+      "3": 1666.6666666666667,
+      "4": 1250.0,
+      "5": 1000.0,
+      "6": 833.3333333333334,
+      "7": 714.2857142857143,
+      "8": 625.0,
+      "9": 555.5555555555555,
+      "10": 500.0,
+      "11": 454.54545454545456,
+      "12": 416.6666666666667,
+      "13": 384.61538461538464,
+      "14": 357.14285714285717,
+      "15": 333.3333333333333,
+      "16": 500.0,
+      "17": 823.5294117647059,
+      "18": 1277.7777777777778,
+      "19": 1842.1052631578948,
+      "20": 2500.0,
+      "21": 3238.095238095238,
+      "22": 4045.4545454545455,
+      "23": 4913.04347826087,
+      "24": 5833.333333333333,
+      "25": 6800.0,
+      "26": 7807.692307692308,
+      "27": 8851.851851851852,
+      "28": 9928.57142857143,
+      "29": 11034.48275862069,
+      "30": 12166.666666666666,
+      "31": 13322.58064516129,
+      "32": 14500.0,
+      "33": 15696.969696969696,
+      "34": 16911.764705882353,
+      "35": 18142.85714285714,
+      "36": 19388.88888888889,
+      "37": 20648.64864864865,
+      "38": 21921.052631578947,
+      "39": 23205.128205128207,
+      "40": 24500.0,
+      "41": 25804.878048780487,
+      "42": 27119.04761904762,
+      "43": 28441.86046511628,
+      "44": 29772.727272727272,
+      "45": 31111.11111111111,
+      "46": 32456.521739130436,
+      "47": 33808.51063829787,
+      "48": 35166.666666666664,
+      "49": 36530.61224489796,
+      "50": 37900.0,
+      "51": 39274.509803921566,
+      "52": 40653.846153846156,
+      "53": 42037.735849056604,
+      "54": 43425.92592592593,
+      "55": 44818.181818181816,
+      "56": 46214.28571428572,
+      "57": 47614.0350877193,
+      "58": 49017.24137931035,
+      "59": 50423.72881355932,
+      "60": 51833.333333333336
+    }
+  },
+  "baseline": {
+    "interval": 30,
+    "events": 12,
+    "decay_loss": 4320000.0,
+    "maintenance_spend": 60000.0,
+    "total_cost": 4380000.0
+  },
+  "optimal": {
+    "interval": 15,
+    "events": 24,
+    "decay_loss": 0.0,
+    "maintenance_spend": 120000.0,
+    "total_cost": 120000.0
+  },
+  "original_claim": {
+    "interval": 17,
+    "events": 21,
+    "decay_loss": 189000.0,
+    "maintenance_spend": 105000.0,
+    "total_cost": 294000.0
+  },
+  "fee_thresholds": {
+    "16": 45000.01668930054,
+    "17": 93000.3821849823,
+    "30": 990000.3671646118
+  },
+  "fee_sensitivity": [
+    {
+      "fee": 5000,
+      "optimal_interval": 15
+    },
+    {
+      "fee": 25000,
+      "optimal_interval": 15
+    },
+    {
+      "fee": 50000,
+      "optimal_interval": 16
+    },
+    {
+      "fee": 100000,
+      "optimal_interval": 17
+    },
+    {
+      "fee": 250000,
+      "optimal_interval": 19
+    },
+    {
+      "fee": 500000,
+      "optimal_interval": 23
+    },
+    {
+      "fee": 1000000,
+      "optimal_interval": 30
+    }
+  ],
+  "interval_comparison": [
+    {
+      "interval": 15,
+      "events": 24,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 120000.0,
+      "expected_total_cost": 120000.0,
+      "simulated_total_cost_mean": 123687.25,
+      "simulated_total_cost_std": 106907.15715607384
+    },
+    {
+      "interval": 16,
+      "events": 22,
+      "expected_decay_loss": 66000.0,
+      "maintenance_spend": 110000.0,
+      "expected_total_cost": 176000.0,
+      "simulated_total_cost_mean": 178690.5,
+      "simulated_total_cost_std": 109571.78464229964
+    },
+    {
+      "interval": 17,
+      "events": 21,
+      "expected_decay_loss": 189000.0,
+      "maintenance_spend": 105000.0,
+      "expected_total_cost": 294000.0,
+      "simulated_total_cost_mean": 290822.5,
+      "simulated_total_cost_std": 101025.22891902152
+    },
+    {
+      "interval": 20,
+      "events": 18,
+      "expected_decay_loss": 810000.0,
+      "maintenance_spend": 90000.0,
+      "expected_total_cost": 900000.0,
+      "simulated_total_cost_mean": 916341.0,
+      "simulated_total_cost_std": 108285.12854645187
+    },
+    {
+      "interval": 25,
+      "events": 14,
+      "expected_decay_loss": 2310000.0,
+      "maintenance_spend": 70000.0,
+      "expected_total_cost": 2380000.0,
+      "simulated_total_cost_mean": 2373645.0,
+      "simulated_total_cost_std": 107253.71448745627
+    },
+    {
+      "interval": 30,
+      "events": 12,
+      "expected_decay_loss": 4320000.0,
+      "maintenance_spend": 60000.0,
+      "expected_total_cost": 4380000.0,
+      "simulated_total_cost_mean": 4379803.0,
+      "simulated_total_cost_std": 115254.37527966358
+    }
+  ],
+  "interval_sweep": [
+    {
+      "interval": 5,
+      "events": 73,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 365000.0,
+      "expected_total_cost": 365000.0,
+      "simulated_total_cost_mean": 381792.0,
+      "simulated_total_cost_std": 111978.51623395973
+    },
+    {
+      "interval": 6,
+      "events": 60,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 300000.0,
+      "expected_total_cost": 300000.0,
+      "simulated_total_cost_mean": 315868.0,
+      "simulated_total_cost_std": 115156.56545480565
+    },
+    {
+      "interval": 7,
+      "events": 52,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 260000.0,
+      "expected_total_cost": 260000.0,
+      "simulated_total_cost_mean": 268646.0,
+      "simulated_total_cost_std": 107455.66757448185
+    },
+    {
+      "interval": 8,
+      "events": 45,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 225000.0,
+      "expected_total_cost": 225000.0,
+      "simulated_total_cost_mean": 226080.0,
+      "simulated_total_cost_std": 112761.52233083476
+    },
+    {
+      "interval": 9,
+      "events": 40,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 200000.0,
+      "expected_total_cost": 200000.0,
+      "simulated_total_cost_mean": 206532.0,
+      "simulated_total_cost_std": 94772.03516322518
+    },
+    {
+      "interval": 10,
+      "events": 36,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 180000.0,
+      "expected_total_cost": 180000.0,
+      "simulated_total_cost_mean": 175473.0,
+      "simulated_total_cost_std": 96699.25194928356
+    },
+    {
+      "interval": 11,
+      "events": 33,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 165000.0,
+      "expected_total_cost": 165000.0,
+      "simulated_total_cost_mean": 159272.0,
+      "simulated_total_cost_std": 103582.0891853413
+    },
+    {
+      "interval": 12,
+      "events": 30,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 150000.0,
+      "expected_total_cost": 150000.0,
+      "simulated_total_cost_mean": 166519.0,
+      "simulated_total_cost_std": 95308.0547220326
+    },
+    {
+      "interval": 13,
+      "events": 28,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 140000.0,
+      "expected_total_cost": 140000.0,
+      "simulated_total_cost_mean": 139237.0,
+      "simulated_total_cost_std": 113641.51422839476
+    },
+    {
+      "interval": 14,
+      "events": 26,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 130000.0,
+      "expected_total_cost": 130000.0,
+      "simulated_total_cost_mean": 146944.0,
+      "simulated_total_cost_std": 100486.09135150019
+    },
+    {
+      "interval": 15,
+      "events": 24,
+      "expected_decay_loss": 0.0,
+      "maintenance_spend": 120000.0,
+      "expected_total_cost": 120000.0,
+      "simulated_total_cost_mean": 139015.0,
+      "simulated_total_cost_std": 105150.7160543127
+    },
+    {
+      "interval": 16,
+      "events": 22,
+      "expected_decay_loss": 66000.0,
+      "maintenance_spend": 110000.0,
+      "expected_total_cost": 176000.0,
+      "simulated_total_cost_mean": 168255.0,
+      "simulated_total_cost_std": 112174.72215618065
+    },
+    {
+      "interval": 17,
+      "events": 21,
+      "expected_decay_loss": 189000.0,
+      "maintenance_spend": 105000.0,
+      "expected_total_cost": 294000.0,
+      "simulated_total_cost_mean": 276795.0,
+      "simulated_total_cost_std": 113004.52639029057
+    },
+    {
+      "interval": 18,
+      "events": 20,
+      "expected_decay_loss": 360000.0,
+      "maintenance_spend": 100000.0,
+      "expected_total_cost": 460000.0,
+      "simulated_total_cost_mean": 416251.0,
+      "simulated_total_cost_std": 101528.69177765284
+    },
+    {
+      "interval": 19,
+      "events": 19,
+      "expected_decay_loss": 570000.0,
+      "maintenance_spend": 95000.0,
+      "expected_total_cost": 665000.0,
+      "simulated_total_cost_mean": 680773.0,
+      "simulated_total_cost_std": 124865.77536764534
+    },
+    {
+      "interval": 20,
+      "events": 18,
+      "expected_decay_loss": 810000.0,
+      "maintenance_spend": 90000.0,
+      "expected_total_cost": 900000.0,
+      "simulated_total_cost_mean": 926332.0,
+      "simulated_total_cost_std": 89727.74168879671
+    },
+    {
+      "interval": 21,
+      "events": 17,
+      "expected_decay_loss": 1071000.0,
+      "maintenance_spend": 85000.0,
+      "expected_total_cost": 1156000.0,
+      "simulated_total_cost_mean": 1142469.0,
+      "simulated_total_cost_std": 113023.07642734754
+    },
+    {
+      "interval": 22,
+      "events": 16,
+      "expected_decay_loss": 1344000.0,
+      "maintenance_spend": 80000.0,
+      "expected_total_cost": 1424000.0,
+      "simulated_total_cost_mean": 1397035.0,
+      "simulated_total_cost_std": 105899.53616614231
+    },
+    {
+      "interval": 23,
+      "events": 15,
+      "expected_decay_loss": 1665000.0,
+      "maintenance_spend": 75000.0,
+      "expected_total_cost": 1740000.0,
+      "simulated_total_cost_mean": 1778428.0,
+      "simulated_total_cost_std": 105315.85155025384
+    },
+    {
+      "interval": 24,
+      "events": 15,
+      "expected_decay_loss": 2025000.0,
+      "maintenance_spend": 75000.0,
+      "expected_total_cost": 2100000.0,
+      "simulated_total_cost_mean": 2107687.0,
+      "simulated_total_cost_std": 93699.44994175663
+    },
+    {
+      "interval": 25,
+      "events": 14,
+      "expected_decay_loss": 2310000.0,
+      "maintenance_spend": 70000.0,
+      "expected_total_cost": 2380000.0,
+      "simulated_total_cost_mean": 2375643.0,
+      "simulated_total_cost_std": 107032.22574514267
+    },
+    {
+      "interval": 26,
+      "events": 14,
+      "expected_decay_loss": 2772000.0,
+      "maintenance_spend": 70000.0,
+      "expected_total_cost": 2842000.0,
+      "simulated_total_cost_mean": 2869298.0,
+      "simulated_total_cost_std": 126581.24557221044
+    },
+    {
+      "interval": 27,
+      "events": 13,
+      "expected_decay_loss": 3042000.0,
+      "maintenance_spend": 65000.0,
+      "expected_total_cost": 3107000.0,
+      "simulated_total_cost_mean": 3109133.0,
+      "simulated_total_cost_std": 124168.00855276364
+    },
+    {
+      "interval": 28,
+      "events": 13,
+      "expected_decay_loss": 3549000.0,
+      "maintenance_spend": 65000.0,
+      "expected_total_cost": 3614000.0,
+      "simulated_total_cost_mean": 3589249.0,
+      "simulated_total_cost_std": 118760.9812280317
+    },
+    {
+      "interval": 29,
+      "events": 12,
+      "expected_decay_loss": 3789000.0,
+      "maintenance_spend": 60000.0,
+      "expected_total_cost": 3849000.0,
+      "simulated_total_cost_mean": 3859534.0,
+      "simulated_total_cost_std": 101842.36039796294
+    },
+    {
+      "interval": 30,
+      "events": 12,
+      "expected_decay_loss": 4320000.0,
+      "maintenance_spend": 60000.0,
+      "expected_total_cost": 4380000.0,
+      "simulated_total_cost_mean": 4399978.0,
+      "simulated_total_cost_std": 137252.66034372
+    },
+    {
+      "interval": 31,
+      "events": 11,
+      "expected_decay_loss": 4623000.0,
+      "maintenance_spend": 55000.0,
+      "expected_total_cost": 4678000.0,
+      "simulated_total_cost_mean": 4666363.0,
+      "simulated_total_cost_std": 102516.69391680876
+    },
+    {
+      "interval": 32,
+      "events": 11,
+      "expected_decay_loss": 5049000.0,
+      "maintenance_spend": 55000.0,
+      "expected_total_cost": 5104000.0,
+      "simulated_total_cost_mean": 5093193.0,
+      "simulated_total_cost_std": 103970.99183848132
+    },
+    {
+      "interval": 33,
+      "events": 11,
+      "expected_decay_loss": 5643000.0,
+      "maintenance_spend": 55000.0,
+      "expected_total_cost": 5698000.0,
+      "simulated_total_cost_mean": 5725067.0,
+      "simulated_total_cost_std": 89952.98239545332
+    },
+    {
+      "interval": 34,
+      "events": 10,
+      "expected_decay_loss": 5865000.0,
+      "maintenance_spend": 50000.0,
+      "expected_total_cost": 5915000.0,
+      "simulated_total_cost_mean": 5905911.0,
+      "simulated_total_cost_std": 127392.78216586362
+    },
+    {
+      "interval": 35,
+      "events": 10,
+      "expected_decay_loss": 6300000.0,
+      "maintenance_spend": 50000.0,
+      "expected_total_cost": 6350000.0,
+      "simulated_total_cost_mean": 6364780.0,
+      "simulated_total_cost_std": 129689.00083960671
+    },
+    {
+      "interval": 36,
+      "events": 10,
+      "expected_decay_loss": 6930000.0,
+      "maintenance_spend": 50000.0,
+      "expected_total_cost": 6980000.0,
+      "simulated_total_cost_mean": 6975214.0,
+      "simulated_total_cost_std": 144201.60102708815
+    },
+    {
+      "interval": 37,
+      "events": 9,
+      "expected_decay_loss": 7290000.0,
+      "maintenance_spend": 45000.0,
+      "expected_total_cost": 7335000.0,
+      "simulated_total_cost_mean": 7315603.0,
+      "simulated_total_cost_std": 116672.29110300564
+    },
+    {
+      "interval": 38,
+      "events": 9,
+      "expected_decay_loss": 7560000.0,
+      "maintenance_spend": 45000.0,
+      "expected_total_cost": 7605000.0,
+      "simulated_total_cost_mean": 7603398.0,
+      "simulated_total_cost_std": 103617.62416082842
+    },
+    {
+      "interval": 39,
+      "events": 9,
+      "expected_decay_loss": 8100000.0,
+      "maintenance_spend": 45000.0,
+      "expected_total_cost": 8145000.0,
+      "simulated_total_cost_mean": 8154223.0,
+      "simulated_total_cost_std": 121635.18942782494
+    },
+    {
+      "interval": 40,
+      "events": 9,
+      "expected_decay_loss": 8775000.0,
+      "maintenance_spend": 45000.0,
+      "expected_total_cost": 8820000.0,
+      "simulated_total_cost_mean": 8810593.0,
+      "simulated_total_cost_std": 130983.4445879419
+    }
+  ],
+  "baseline_run": {
+    "days": 365,
+    "opening_cash": 100000.0,
+    "revenue": 108328700.0,
+    "material_spend": 7432500.0,
+    "maintenance_spend": 60000.0,
+    "maintenance_events": 12,
+    "closing_cash": 100936200.0,
+    "station_stoppages": 0,
+    "units_by_sku": {
+      "MPU-XL-A": 72412,
+      "MPU-XL-B": 21857,
+      "MPU-XL-SCRAP": 15231,
+      "MESH-AIM": 13171,
+      "MESH-SCRAP": 1429,
+      "SUB-PE": 65765,
+      "SUB-SCRAP": 7235
+    }
+  }
+}
