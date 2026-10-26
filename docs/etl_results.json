@@ -1,0 +1,292 @@
+{
+  "export": {
+    "files_written": 1685,
+    "records_written": 24650,
+    "defects": {
+      "code_variant": 3688,
+      "corrected_resend": 22,
+      "double_keyed_line": 6,
+      "duplicate_file": 34,
+      "duplicate_row": 54,
+      "duplicate_row_original": 54,
+      "duplicate_wo_event": 3,
+      "header_repeat": 40,
+      "late_file": 81,
+      "malformed_row": 24,
+      "missing_key": 4,
+      "reversed_invoice": 40,
+      "superseded_revision": 22,
+      "unknown_code": 8,
+      "uom_box": 34
+    }
+  },
+  "pipeline": {
+    "files_loaded": 1651,
+    "duplicate_files": 34,
+    "entities": [
+      {
+        "entity": "production_events",
+        "records": 14190,
+        "rejected": 18,
+        "duplicates_removed": 76,
+        "rows": 14096,
+        "partitions_written": 12
+      },
+      {
+        "entity": "material_issues",
+        "records": 6570,
+        "rejected": 0,
+        "duplicates_removed": 0,
+        "rows": 6570,
+        "partitions_written": 12
+      },
+      {
+        "entity": "invoice_lines",
+        "records": 3046,
+        "rejected": 18,
+        "duplicates_removed": 0,
+        "rows": 3028,
+        "partitions_written": 12
+      },
+      {
+        "entity": "goods_receipts",
+        "records": 140,
+        "rejected": 0,
+        "duplicates_removed": 0,
+        "rows": 140,
+        "partitions_written": 12
+      },
+      {
+        "entity": "stock_snapshots",
+        "records": 159,
+        "rejected": 0,
+        "duplicates_removed": 0,
+        "rows": 159,
+        "partitions_written": 12
+      },
+      {
+        "entity": "work_order_events",
+        "records": 27,
+        "rejected": 0,
+        "duplicates_removed": 3,
+        "rows": 24,
+        "partitions_written": 11
+      },
+      {
+        "entity": "bank_transactions",
+        "records": 518,
+        "rejected": 0,
+        "duplicates_removed": 0,
+        "rows": 518,
+        "partitions_written": 12
+      }
+    ],
+    "recon": {
+      "bank_balance_continuity": {
+        "rows": 365,
+        "matched": 365,
+        "explained": 0,
+        "open": 0,
+        "exceptions": 0
+      },
+      "customer_receipts": {
+        "rows": 365,
+        "matched": 342,
+        "explained": 17,
+        "open": 1,
+        "exceptions": 5
+      },
+      "inventory_roll_forward": {
+        "rows": 156,
+        "matched": 156,
+        "explained": 0,
+        "open": 0,
+        "exceptions": 0
+      },
+      "maintenance_payments": {
+        "rows": 12,
+        "matched": 12,
+        "explained": 0,
+        "open": 0,
+        "exceptions": 0
+      },
+      "mass_balance": {
+        "rows": 2190,
+        "matched": 2172,
+        "explained": 18,
+        "open": 0,
+        "exceptions": 0
+      },
+      "production_vs_sales": {
+        "rows": 1460,
+        "matched": 1424,
+        "explained": 30,
+        "open": 1,
+        "exceptions": 5
+      },
+      "supplier_payments": {
+        "rows": 140,
+        "matched": 140,
+        "explained": 0,
+        "open": 0,
+        "exceptions": 0
+      }
+    }
+  },
+  "evaluation": {
+    "manifest_entries": 4114,
+    "defects": [
+      {
+        "defect": "duplicate_file",
+        "injected": 34,
+        "handled": 34,
+        "how": "re-delivered file skipped by content hash"
+      },
+      {
+        "defect": "late_file",
+        "injected": 81,
+        "handled": 81,
+        "how": "loaded in a later batch under its business date"
+      },
+      {
+        "defect": "header_repeat",
+        "injected": 40,
+        "handled": 40,
+        "how": "repeated header dropped, nothing else quarantined"
+      },
+      {
+        "defect": "duplicate_row",
+        "injected": 54,
+        "handled": 54,
+        "how": "one silver row per event id"
+      },
+      {
+        "defect": "corrected_resend",
+        "injected": 22,
+        "handled": 22,
+        "how": "revision 2 wins over revision 1"
+      },
+      {
+        "defect": "code_variant",
+        "injected": 3688,
+        "handled": 3688,
+        "how": "code mapped to its canonical value"
+      },
+      {
+        "defect": "uom_box",
+        "injected": 34,
+        "handled": 34,
+        "how": "boxes of 25 converted to each"
+      },
+      {
+        "defect": "duplicate_wo_event",
+        "injected": 3,
+        "handled": 3,
+        "how": "one maintenance fact per work order"
+      },
+      {
+        "defect": "reversed_invoice",
+        "injected": 40,
+        "handled": 40,
+        "how": "duplicate invoice and its credit memo both kept (net zero)"
+      },
+      {
+        "defect": "malformed_row",
+        "injected": 24,
+        "handled": 24,
+        "how": "quarantined with a reason"
+      },
+      {
+        "defect": "unknown_code",
+        "injected": 8,
+        "handled": 8,
+        "how": "quarantined as unknown_sku"
+      },
+      {
+        "defect": "missing_key",
+        "injected": 4,
+        "handled": 4,
+        "how": "quarantined as missing_key"
+      },
+      {
+        "defect": "double_keyed_line",
+        "injected": 6,
+        "handled": 6,
+        "how": "not row-detectable; flagged by reconciliation"
+      }
+    ],
+    "quarantine": {
+      "quarantined": 36,
+      "expected": 36,
+      "true_positives": 36,
+      "precision": 1.0,
+      "recall": 1.0,
+      "correct_reason": 36
+    },
+    "reconciliation": {
+      "exceptions": 10,
+      "expected_business_errors": 12,
+      "business_errors_flagged": 12,
+      "flagged_as_exception": 10,
+      "masked_by_quarantine": 0,
+      "unexpected_exceptions": [],
+      "status_counts": {
+        "matched": 4611,
+        "exception": 10,
+        "explained_by_quarantine": 65,
+        "open_late_window": 2
+      }
+    },
+    "gold_vs_truth": {
+      "production_units": {
+        "cells": 5020,
+        "exact": 5002,
+        "explained_by_injected_defects": 18,
+        "unexplained": 0,
+        "unexplained_examples": []
+      },
+      "sales_units": {
+        "cells": 1460,
+        "exact": 1436,
+        "explained_by_injected_defects": 24,
+        "unexplained": 0,
+        "unexplained_examples": []
+      },
+      "sales_revenue": {
+        "cells": 1460,
+        "exact": 1436,
+        "explained_by_injected_defects": 24,
+        "unexplained": 0,
+        "unexplained_examples": []
+      },
+      "goods_receipts_units": {
+        "cells": 140,
+        "exact": 140,
+        "explained_by_injected_defects": 0,
+        "unexplained": 0,
+        "unexplained_examples": []
+      },
+      "maintenance_cost": {
+        "cells": 12,
+        "exact": 12,
+        "explained_by_injected_defects": 0,
+        "unexplained": 0,
+        "unexplained_examples": []
+      },
+      "bank_closing_balance": {
+        "cells": 365,
+        "exact": 365,
+        "explained_by_injected_defects": 0,
+        "unexplained": 0,
+        "unexplained_examples": []
+      },
+      "stock_snapshots": {
+        "cells": 159,
+        "exact": 159,
+        "explained_by_injected_defects": 0,
+        "unexplained": 0,
+        "unexplained_examples": []
+      }
+    }
+  }
+}

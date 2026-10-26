@@ -4,18 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "factorysim"
-version = "2.0.0"
-description = "Daily time-step factory simulation with a SQLite ledger and a maintenance-interval cost analysis."
+version = "3.0.0"
+description = "Factory simulator, messy source-system exports, and a DuckDB ETL + reconciliation pipeline scored against ground truth."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "numpy>=1.24",
+    "duckdb>=1.1",
+    "pyarrow>=14",
     "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.4"]
+spark = ["pyspark==3.5.3"]
 
 [project.scripts]
 factorysim = "factorysim.cli:main"
@@ -24,7 +27,7 @@ factorysim = "factorysim.cli:main"
 include = ["factorysim*"]
 
 [tool.setuptools.package-data]
-factorysim = ["sql/*.sql"]
+factorysim = ["sql/*.sql", "etl/sql/*/*.sql", "etl/reference/*.csv"]
 
 [tool.ruff]
 line-length = 100

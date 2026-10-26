@@ -1,0 +1,36 @@
+-- ERP goods receipts. Wafers are sometimes received in boxes of 25 (UoM BX25).
+WITH parsed AS (
+    SELECT
+        *,
+        NULLIF(trim(record ->> 'gr_number'), '') AS gr_no,
+        NULLIF(trim(record ->> 'po_number'), '') AS po_no,
+        CAST(try_strptime(record ->> 'receipt_date', '%Y-%m-%d') AS DATE) AS receipt_date,
+        upper(trim(record ->> 'material')) AS material_raw,
+        TRY_CAST(record ->> 'quantity' AS INTEGER) AS qty,
+        upper(trim(record ->> 'uom')) AS uom,
+        TRY_CAST(regexp_replace(record ->> 'unit_cost', '[$,\s]', '', 'g') AS DECIMAL(18, 4))
+            AS unit_cost,
+        TRY_CAST(regexp_replace(record ->> 'extended_cost', '[$,\s]', '', 'g') AS DECIMAL(18, 2))
+            AS amount
+    FROM bronze
+)
+SELECT
+    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    CASE
+        WHEN _parse_error IS NOT NULL THEN 'malformed_record'
+        WHEN gr_no IS NULL OR po_no IS NULL THEN 'missing_key'
+        WHEN receipt_date IS NULL THEN 'invalid_date'
+        WHEN qty IS NULL OR qty <= 0 THEN 'invalid_quantity'
+        WHEN unit_cost IS NULL OR amount IS NULL THEN 'invalid_amount'
+        WHEN abs(qty * unit_cost - amount) > 0.01 THEN 'amount_mismatch'
+        WHEN m.material_code IS NULL THEN 'unknown_material'
+        WHEN u.units_per_uom IS NULL THEN 'unknown_uom'
+    END AS reject_reason,
+    receipt_date AS business_date,
+    gr_no, po_no, m.material_code,
+    p.qty AS qty_received, p.uom AS uom_received,
+    p.qty * u.units_per_uom AS qty_base,
+    amount
+FROM parsed p
+LEFT JOIN ref_materials m ON m.material_code = p.material_raw
+LEFT JOIN ref_uom_conversions u ON u.material_code = p.material_raw AND u.uom = p.uom

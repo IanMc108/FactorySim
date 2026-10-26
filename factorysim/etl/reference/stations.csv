@@ -1,0 +1,7 @@
+station_code,station_name,input_material_code,product_family
+LITHO-A,Lithography Line A,SI-WFR-300,Microprocessor XL
+LITHO-B,Lithography Line B,SI-WFR-300,Microprocessor XL
+PLATE-A,Electroplating Cell A,CU-ANODE,Mesh
+PLATE-B,Electroplating Cell B,CU-ANODE,Mesh
+CHEM-A,Chemical Track A,PR-POLY,Etch Substrates
+CHEM-B,Chemical Track B,PR-POLY,Etch Substrates
