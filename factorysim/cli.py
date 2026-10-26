@@ -47,7 +47,7 @@ def _export(build: Path, seed: int, defect_seed: int) -> None:
         print(f"  {defect:24} {count}")
 
 
-def _etl(landing: Path, lake: Path, through: date | None) -> None:
+def _etl(landing: Path, lake: Path, through: date | None):
     from .etl.pipeline import run_pipeline
 
     s = run_pipeline(landing, lake, through)
@@ -59,14 +59,21 @@ def _etl(landing: Path, lake: Path, through: date | None) -> None:
     for e in s.entities:
         print(f"  {e.entity:20} {e.records:8} {e.rejected:8} {e.duplicates_removed:8} {e.rows:8}")
     print(
-        f"  {'reconciliation':24} {'rows':>6} {'match':>6} {'expl.':>6} {'open':>6} "
-        f"{'review':>6} {'exc.':>6}"
+        f"  {'reconciliation':24} {'rows':>6} {'match':>6} {'open':>6} {'exc.':>6} "
+        f"{'w/ evidence':>11}"
     )
     for name, r in s.recon.items():
         print(
-            f"  {name:24} {r['rows']:6} {r['matched']:6} {r['explained']:6} {r['open']:6} "
-            f"{r['needs_review']:6} {r['exceptions']:6}"
+            f"  {name:24} {r['rows']:6} {r['matched']:6} {r['open']:6} {r['exceptions']:6} "
+            f"{r['with_evidence']:11}"
         )
+    print(
+        f"Since the last run: {s.changes['new_exceptions']} new exceptions, "
+        f"{s.changes['cleared_exceptions']} cleared"
+    )
+    for file, error in s.rejected_files:
+        print(f"  REJECTED {file}: {error}")
+    return s
 
 
 def _evaluate(build: Path) -> dict:
@@ -85,8 +92,11 @@ def _evaluate(build: Path) -> dict:
     )
     r = results["reconciliation"]
     print(
-        f"Reconciliation: {r['exceptions']} exceptions, {r['business_errors_flagged']}/"
-        f"{r['expected_business_errors']} injected business errors flagged"
+        f"Reconciliation: {r['exceptions']} exceptions. Injected business errors: "
+        f"{r['business_errors_caught']} caught, {r['business_errors_open']} open, "
+        f"{len(r['business_errors_missed'])} missed of {r['expected_business_errors']}. "
+        f"Lost-record rows flagged with evidence: {r['data_loss_rows_with_evidence']}/"
+        f"{r['expected_data_loss_rows']}. Unexpected: {len(r['unexpected_exceptions'])}"
     )
     for name, c in results["gold_vs_truth"].items():
         print(
@@ -131,6 +141,11 @@ def main(argv: list[str] | None = None) -> None:
     etl = sub.add_parser("etl", help="run the pipeline over newly landed files")
     etl.add_argument("--landing", type=Path, default=Path("build/landing"))
     etl.add_argument("--lake", type=Path, default=Path("build/lake"))
+    etl.add_argument(
+        "--fail-on-new-exceptions",
+        action="store_true",
+        help="exit 2 if this run raised exceptions the previous run did not have",
+    )
     etl.add_argument(
         "--through",
         type=date.fromisoformat,
@@ -179,7 +194,11 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "export":
         _export(args.build, args.seed, args.defect_seed)
     elif args.command == "etl":
-        _etl(args.landing, args.lake, args.through)
+        summary = _etl(args.landing, args.lake, args.through)
+        if args.fail_on_new_exceptions and summary.changes["new_exceptions"]:
+            raise SystemExit(2)
+        if summary.rejected_files:
+            raise SystemExit(3)
     elif args.command == "evaluate":
         results = _evaluate(args.build)
         if args.json:

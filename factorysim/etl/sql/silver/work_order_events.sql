@@ -15,7 +15,8 @@ WITH parsed AS (
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _arrival_ts, _ingest_seq,
+    _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN work_order IS NULL THEN 'missing_key'

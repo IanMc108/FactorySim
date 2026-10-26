@@ -2,39 +2,39 @@
   "defect_seed": 7,
   "batch_days": null,
   "export": {
-    "files_written": 1679,
-    "records_written": 24613,
+    "files_written": 1673,
+    "records_written": 24631,
     "defects": {
-      "code_variant": 3683,
-      "corrected_resend": 22,
-      "double_keyed_line": 6,
-      "double_payment": 1,
-      "duplicate_file": 29,
-      "duplicate_row": 54,
-      "duplicate_row_original": 54,
-      "duplicate_wo_event": 3,
-      "header_repeat": 39,
-      "late_file": 88,
-      "late_payment": 3,
-      "malformed_row": 24,
+      "code_variant": 3665,
+      "corrected_resend": 29,
+      "double_keyed_line": 7,
+      "double_payment": 2,
+      "duplicate_file": 23,
+      "duplicate_row": 60,
+      "duplicate_row_original": 60,
+      "duplicate_wo_event": 4,
+      "header_repeat": 45,
+      "late_file": 99,
+      "late_payment": 2,
+      "malformed_row": 31,
       "missing_file": 1,
-      "missing_key": 4,
-      "reversed_invoice": 40,
-      "superseded_revision": 22,
-      "unknown_code": 8,
-      "uom_box": 34
+      "missing_key": 15,
+      "reversed_invoice": 32,
+      "superseded_revision": 29,
+      "unknown_code": 5,
+      "uom_box": 35
     }
   },
   "pipeline": {
     "files_loaded": 1650,
-    "duplicate_files": 29,
+    "duplicate_files": 23,
     "entities": [
       {
         "entity": "production_events",
-        "records": 14152,
-        "rejected": 18,
-        "duplicates_removed": 76,
-        "rows": 14058,
+        "records": 14163,
+        "rejected": 26,
+        "duplicates_removed": 89,
+        "rows": 14048,
         "partitions_written": 12
       },
       {
@@ -47,10 +47,10 @@
       },
       {
         "entity": "invoice_lines",
-        "records": 3046,
-        "rejected": 18,
+        "records": 3051,
+        "rejected": 25,
         "duplicates_removed": 0,
-        "rows": 3028,
+        "rows": 3026,
         "partitions_written": 12
       },
       {
@@ -71,196 +71,347 @@
       },
       {
         "entity": "work_order_events",
-        "records": 27,
+        "records": 28,
         "rejected": 0,
-        "duplicates_removed": 3,
+        "duplicates_removed": 4,
         "rows": 24,
         "partitions_written": 11
       },
       {
         "entity": "bank_transactions",
-        "records": 519,
+        "records": 520,
         "rejected": 0,
         "duplicates_removed": 0,
-        "rows": 519,
+        "rows": 520,
         "partitions_written": 12
       }
     ],
     "recon": {
       "bank_balance_continuity": {
-        "rows": 518,
-        "matched": 518,
-        "explained": 0,
+        "rows": 519,
+        "matched": 519,
         "open": 0,
-        "needs_review": 0,
-        "exceptions": 0
+        "exceptions": 0,
+        "with_evidence": 0
       },
       "credit_memo_references": {
-        "rows": 5,
-        "matched": 5,
-        "explained": 0,
+        "rows": 4,
+        "matched": 4,
         "open": 0,
-        "needs_review": 0,
-        "exceptions": 0
+        "exceptions": 0,
+        "with_evidence": 0
       },
       "customer_receipts": {
         "rows": 365,
-        "matched": 342,
-        "explained": 13,
+        "matched": 334,
         "open": 1,
-        "needs_review": 4,
-        "exceptions": 5
+        "exceptions": 30,
+        "with_evidence": 24
+      },
+      "file_version_shrink": {
+        "rows": 23,
+        "matched": 23,
+        "open": 0,
+        "exceptions": 0,
+        "with_evidence": 0
       },
       "inventory_roll_forward": {
         "rows": 156,
         "matched": 156,
-        "explained": 0,
         "open": 0,
-        "needs_review": 0,
-        "exceptions": 0
+        "exceptions": 0,
+        "with_evidence": 0
       },
       "maintenance_payments": {
         "rows": 12,
         "matched": 12,
-        "explained": 0,
         "open": 0,
-        "needs_review": 0,
-        "exceptions": 0
+        "exceptions": 0,
+        "with_evidence": 0
       },
       "mass_balance": {
         "rows": 2190,
-        "matched": 2166,
-        "explained": 0,
+        "matched": 2158,
         "open": 0,
-        "needs_review": 18,
-        "exceptions": 6
+        "exceptions": 32,
+        "with_evidence": 26
       },
       "production_vs_sales": {
         "rows": 1460,
-        "matched": 1420,
-        "explained": 24,
+        "matched": 1408,
         "open": 1,
-        "needs_review": 6,
-        "exceptions": 9
+        "exceptions": 51,
+        "with_evidence": 40
       },
       "supplier_payments": {
-        "rows": 143,
+        "rows": 142,
         "matched": 136,
-        "explained": 0,
         "open": 0,
-        "needs_review": 0,
-        "exceptions": 7
+        "exceptions": 6,
+        "with_evidence": 0
       }
     }
   },
   "evaluation": {
-    "manifest_entries": 4115,
+    "manifest_entries": 4144,
+    "business_error_rows": [
+      [
+        "customer_receipts",
+        "2025-02-08",
+        "ALL"
+      ],
+      [
+        "customer_receipts",
+        "2025-03-28",
+        "ALL"
+      ],
+      [
+        "customer_receipts",
+        "2025-04-04",
+        "ALL"
+      ],
+      [
+        "customer_receipts",
+        "2025-08-03",
+        "ALL"
+      ],
+      [
+        "customer_receipts",
+        "2025-08-28",
+        "ALL"
+      ],
+      [
+        "customer_receipts",
+        "2025-10-07",
+        "ALL"
+      ],
+      [
+        "customer_receipts",
+        "2025-12-15",
+        "ALL"
+      ],
+      [
+        "mass_balance",
+        "2025-12-04",
+        "CHEM-A"
+      ],
+      [
+        "mass_balance",
+        "2025-12-04",
+        "CHEM-B"
+      ],
+      [
+        "mass_balance",
+        "2025-12-04",
+        "LITHO-A"
+      ],
+      [
+        "mass_balance",
+        "2025-12-04",
+        "LITHO-B"
+      ],
+      [
+        "mass_balance",
+        "2025-12-04",
+        "PLATE-A"
+      ],
+      [
+        "mass_balance",
+        "2025-12-04",
+        "PLATE-B"
+      ],
+      [
+        "production_vs_sales",
+        "2025-02-08",
+        "SUB-PE"
+      ],
+      [
+        "production_vs_sales",
+        "2025-03-28",
+        "MPU-XL-B"
+      ],
+      [
+        "production_vs_sales",
+        "2025-04-04",
+        "MESH-AIM"
+      ],
+      [
+        "production_vs_sales",
+        "2025-08-03",
+        "MPU-XL-B"
+      ],
+      [
+        "production_vs_sales",
+        "2025-08-28",
+        "MPU-XL-B"
+      ],
+      [
+        "production_vs_sales",
+        "2025-10-07",
+        "MESH-AIM"
+      ],
+      [
+        "production_vs_sales",
+        "2025-12-04",
+        "MESH-AIM"
+      ],
+      [
+        "production_vs_sales",
+        "2025-12-04",
+        "MPU-XL-A"
+      ],
+      [
+        "production_vs_sales",
+        "2025-12-04",
+        "MPU-XL-B"
+      ],
+      [
+        "production_vs_sales",
+        "2025-12-04",
+        "SUB-PE"
+      ],
+      [
+        "production_vs_sales",
+        "2025-12-15",
+        "MPU-XL-A"
+      ],
+      [
+        "supplier_payments",
+        "2025-04-14",
+        "PO-000039"
+      ],
+      [
+        "supplier_payments",
+        "2025-04-20",
+        "PO-000039 (payment outside terms or without receipt)"
+      ],
+      [
+        "supplier_payments",
+        "2025-05-04",
+        "PO-000046"
+      ],
+      [
+        "supplier_payments",
+        "2025-06-28",
+        "PO-000068"
+      ],
+      [
+        "supplier_payments",
+        "2025-07-28",
+        "PO-000080"
+      ],
+      [
+        "supplier_payments",
+        "2025-08-05",
+        "PO-000080 (payment outside terms or without receipt)"
+      ]
+    ],
     "batches": 1,
     "late_files_in_later_batch": 0,
     "defects": [
       {
         "defect": "duplicate_file",
         "kind": "data",
-        "injected": 29,
-        "handled": 29,
+        "injected": 23,
+        "handled": 23,
         "how": "re-delivered copy not loaded again; its business date's gold numbers match the truth"
       },
       {
         "defect": "late_file",
         "kind": "data",
-        "injected": 88,
-        "handled": 88,
+        "injected": 99,
+        "handled": 99,
         "how": "loaded after its business date (a later batch when run incrementally); that date's gold numbers match the truth"
       },
       {
         "defect": "header_repeat",
         "kind": "data",
-        "injected": 39,
-        "handled": 39,
+        "injected": 45,
+        "handled": 45,
         "how": "repeated header dropped, nothing else quarantined"
       },
       {
         "defect": "duplicate_row",
         "kind": "data",
-        "injected": 54,
-        "handled": 54,
+        "injected": 60,
+        "handled": 60,
         "how": "one silver row per event id; the production total matches the truth"
       },
       {
         "defect": "corrected_resend",
         "kind": "data",
-        "injected": 22,
-        "handled": 22,
+        "injected": 29,
+        "handled": 29,
         "how": "revision 2 wins over revision 1; the production total matches the truth"
       },
       {
         "defect": "code_variant",
         "kind": "normalization",
-        "injected": 3683,
-        "handled": 3683,
+        "injected": 3665,
+        "handled": 3665,
         "how": "mapped through the alias tables (maintained reference data; a code missing from them is the unknown_code case)"
       },
       {
         "defect": "uom_box",
         "kind": "data",
-        "injected": 34,
-        "handled": 34,
+        "injected": 35,
+        "handled": 35,
         "how": "boxes of 25 converted to each"
       },
       {
         "defect": "duplicate_wo_event",
         "kind": "data",
-        "injected": 3,
-        "handled": 3,
+        "injected": 4,
+        "handled": 4,
         "how": "one completion event survives; the work order's cost matches the truth"
       },
       {
         "defect": "reversed_invoice",
         "kind": "data",
-        "injected": 40,
-        "handled": 40,
+        "injected": 32,
+        "handled": 32,
         "how": "duplicate invoice and credit memo both kept; the day's sales match the truth"
       },
       {
         "defect": "malformed_row",
         "kind": "data",
-        "injected": 24,
-        "handled": 24,
-        "how": "quarantined with the right reason; gold differs from the truth by exactly the lost record"
+        "injected": 31,
+        "handled": 31,
+        "how": "quarantined with the right reason; gold differs from the truth by exactly the lost record; reconciliation flags it with the record attached"
       },
       {
         "defect": "unknown_code",
         "kind": "data",
-        "injected": 8,
-        "handled": 8,
-        "how": "quarantined as unknown_sku, never guessed; gold differs by exactly the lost line"
+        "injected": 5,
+        "handled": 5,
+        "how": "quarantined as unknown_sku, never guessed; gold differs by exactly the lost line; reconciliation flags it with the record attached"
       },
       {
         "defect": "missing_key",
         "kind": "data",
-        "injected": 4,
-        "handled": 4,
-        "how": "quarantined as missing_key; gold differs by exactly the lost line"
+        "injected": 15,
+        "handled": 15,
+        "how": "quarantined as missing_key; gold differs by exactly the lost line; reconciliation flags it with the record attached"
       },
       {
         "defect": "double_keyed_line",
         "kind": "business_error",
-        "injected": 6,
-        "handled": 6,
+        "injected": 7,
+        "handled": 7,
         "how": "billing error: production vs. sales and deposits flag it"
       },
       {
         "defect": "double_payment",
         "kind": "business_error",
-        "injected": 1,
-        "handled": 1,
+        "injected": 2,
+        "handled": 2,
         "how": "PO paid twice: supplier-payment check flags it"
       },
       {
         "defect": "late_payment",
         "kind": "business_error",
-        "injected": 3,
-        "handled": 3,
+        "injected": 2,
+        "handled": 2,
         "how": "PO paid outside terms: both the PO and the payment are flagged"
       },
       {
@@ -272,36 +423,35 @@
       }
     ],
     "quarantine": {
-      "quarantined": 36,
-      "expected": 36,
-      "true_positives": 36,
+      "quarantined": 51,
+      "expected": 51,
+      "true_positives": 51,
       "precision": 1.0,
       "recall": 1.0,
-      "correct_reason": 36
+      "correct_reason": 51
     },
     "reconciliation": {
-      "exceptions": 27,
-      "expected_business_errors": 29,
-      "business_errors_flagged": 29,
-      "flagged_as_exception": 27,
-      "flagged_for_review": 0,
-      "masked_by_quarantine": 0,
-      "missed": [],
+      "exceptions": 119,
+      "expected_business_errors": 30,
+      "business_errors_caught": 30,
+      "business_errors_open": 0,
+      "business_errors_missed": [],
+      "business_errors_with_evidence": 1,
+      "expected_data_loss_rows": 92,
+      "data_loss_rows_flagged": 92,
+      "data_loss_rows_with_evidence": 92,
       "unexpected_exceptions": [],
-      "rows_needing_review": 28,
       "status_counts": {
-        "matched": 4755,
-        "exception": 27,
-        "needs_review": 28,
-        "explained_by_quarantine": 37,
+        "matched": 4750,
+        "exception": 119,
         "open_late_window": 2
       }
     },
     "gold_vs_truth": {
       "production_units": {
         "cells": 5020,
-        "exact": 4989,
-        "explained_by_injected_defects": 31,
+        "exact": 4980,
+        "explained_by_injected_defects": 40,
         "unexplained": 0,
         "unexplained_examples": []
       },
@@ -314,15 +464,15 @@
       },
       "sales_units": {
         "cells": 1460,
-        "exact": 1436,
-        "explained_by_injected_defects": 24,
+        "exact": 1428,
+        "explained_by_injected_defects": 32,
         "unexplained": 0,
         "unexplained_examples": []
       },
       "sales_revenue": {
         "cells": 1460,
-        "exact": 1436,
-        "explained_by_injected_defects": 24,
+        "exact": 1428,
+        "explained_by_injected_defects": 32,
         "unexplained": 0,
         "unexplained_examples": []
       },
@@ -342,8 +492,8 @@
       },
       "bank_closing_balance": {
         "cells": 365,
-        "exact": 329,
-        "explained_by_injected_defects": 36,
+        "exact": 117,
+        "explained_by_injected_defects": 248,
         "unexplained": 0,
         "unexplained_examples": []
       },

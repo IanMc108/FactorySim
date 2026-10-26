@@ -172,8 +172,8 @@ def _fuzz_landing(root: Path, seed: int, n: int = 300) -> None:
     ids = [f"F{i}" for i in range(n // 3)]  # shared ids exercise dedup and revisions
     stations = ["LITHO-A", "lith-a", " CHEM-B ", "EPC-A", "LITHO-Z", ""]
     skus = ["MPU-XL-A", "mpuxl-b", " SUB-PE", "MESH-AIN", "MPU-XL-SCRAP", ""]
-    qtys = ["5", "0", "-3", "10.5", "1e3", " 7 ", "007", "", "1_000", "12"]
-    revs = ["1", "2", "3", "1.0", " 2", "x", ""]
+    qtys = ["5", "0", "-3", "10.5", "1e3", " 7 ", "007", "", "1_000", "12", "10\n", "\t5", "5\r"]
+    revs = ["1", "2", "3", "1.0", " 2", "x", "", "1\n"]
 
     def v1_time() -> str:
         day = rnd.choice(["2025-03-09", "2025-11-02", "2025-06-15"])

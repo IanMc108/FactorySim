@@ -30,8 +30,7 @@ from .lake import Lake, _q, atomic_copy
 
 LATE_ARRIVAL_WINDOW_DAYS = 7
 PAYMENT_TERMS_DAYS = 3
-MAX_OPTIONAL_EFFECTS = 12
-STATUSES = ("matched", "explained_by_quarantine", "open_late_window", "needs_review", "exception")
+STATUSES = ("matched", "open_late_window", "exception")
 
 
 @dataclass(frozen=True)
@@ -40,8 +39,12 @@ class Entity:
     source: str
     keys: tuple[str, ...]
     # Among duplicates of one key, the first row in this order wins: the newest extract
-    # (file business date), then the most recently ingested file, then the last record.
-    latest_first: str = "_file_business_date DESC, _ingest_seq DESC, _record_number DESC"
+    # (file business date), then the file that landed last (arrival folder, then arrival
+    # time), then the last record. Ingest order is only a final tie-break.
+    latest_first: str = (
+        "_file_business_date DESC, _arrival_date DESC, _arrival_ts DESC, _ingest_seq DESC, "
+        "_record_number DESC"
+    )
 
 
 ENTITIES = (
@@ -49,7 +52,8 @@ ENTITIES = (
         "production_events",
         "mes_production",
         ("event_id",),
-        "revision DESC, _file_business_date DESC, _ingest_seq DESC, _record_number DESC",
+        "revision DESC, _file_business_date DESC, _arrival_date DESC, _arrival_ts DESC, "
+        "_ingest_seq DESC, _record_number DESC",
     ),
     Entity("material_issues", "mes_material_issues", ("issue_id",)),
     Entity("invoice_lines", "erp_invoices", ("doc_no", "line_no")),
@@ -65,15 +69,6 @@ ENTITIES = (
 MACROS = r"""
 CREATE OR REPLACE MACRO strict_int(s) AS
     CASE WHEN regexp_full_match(trim(s), '-?[0-9]+') THEN TRY_CAST(trim(s) AS BIGINT) END;
--- True if req plus some subset of opts equals target. Callers keep opts to at most
--- MAX_OPTIONAL_EFFECTS elements; a longer list is never "explained" (see build_gold).
-CREATE OR REPLACE MACRO subset_sum_matches(req, opts, target) AS
-    CASE WHEN opts IS NULL OR len(opts) = 0 THEN req = target
-         WHEN len(opts) > 12 THEN false
-         ELSE len(list_filter(range(0, 1 << len(opts)), lambda m:
-              req + list_sum(list_transform(range(len(opts)), lambda i:
-                  CASE WHEN ((m >> i) & 1) = 1 THEN opts[i + 1] ELSE 0 END)) = target)) > 0
-    END;
 -- Timestamps must match their pattern exactly (no single-digit fields or stray spaces).
 CREATE OR REPLACE MACRO strict_ts(s, pattern, fmt) AS
     CASE WHEN regexp_full_match(s, pattern) THEN try_strptime(s, fmt) END;
@@ -88,8 +83,11 @@ CREATE OR REPLACE MACRO local_time_problem(t) AS
               OR utc_to_local(local_to_utc(t) - INTERVAL 1 HOUR) = t
              THEN 'ambiguous_local_time'
     END;
+-- Money: an optional "$", then digits with correctly placed thousands separators (or
+-- none), then up to 4 decimals. "1,0,0" and "12.345,6" are rejected, not reinterpreted.
 CREATE OR REPLACE MACRO money(s) AS
-    CASE WHEN regexp_full_match(regexp_replace(s, '[$,\s]', '', 'g'), '-?[0-9]+(\.[0-9]{1,4})?')
+    CASE WHEN regexp_full_match(regexp_replace(s, '[$\s]', '', 'g'),
+                                '-?([0-9]{1,3}(,[0-9]{3})+|[0-9]+)(\.[0-9]{1,4})?')
          THEN TRY_CAST(regexp_replace(s, '[$,\s]', '', 'g') AS DECIMAL(18, 4)) END;
 """
 QUARANTINE_SELECT = """
@@ -118,6 +116,7 @@ class RunSummary:
     watermark: date | None
     entities: list[EntityStats]
     recon: dict[str, dict[str, int]]
+    changes: dict[str, int]
 
 
 def _sql(*parts: str) -> str:
@@ -222,7 +221,7 @@ def build_silver(conn, lake: Lake) -> list[EntityStats]:
         keys = ", ".join(entity.keys)
         conn.execute(
             f"""CREATE OR REPLACE TEMP TABLE silver_new AS
-                SELECT * EXCLUDE (reject_reason, _raw, record, _ingest_seq),
+                SELECT * EXCLUDE (reject_reason, _raw, record, _ingest_seq, _arrival_ts),
                        strftime(business_date, '%Y-%m') AS business_month
                 FROM validated WHERE reject_reason IS NULL
                 QUALIFY row_number() OVER (
@@ -258,12 +257,13 @@ def _lake_view(conn, lake: Lake, layer: str, name: str, view: str, empty_sql: st
         conn.execute(f"CREATE OR REPLACE TEMP VIEW {view} AS {empty_sql}")
 
 
-def build_gold(conn, lake: Lake, watermark: date) -> dict[str, dict[str, int]]:
+def build_gold(conn, lake: Lake, watermark: date) -> tuple[dict, dict]:
     # Read silver and quarantine back from the lake, so gold reflects persisted state only.
     for entity in ENTITIES:
         _bronze_view(conn, lake, entity.source)
         empty = (
-            f"SELECT * EXCLUDE (reject_reason, _raw, record, _ingest_seq), '' AS business_month "
+            "SELECT * EXCLUDE (reject_reason, _raw, record, _ingest_seq, _arrival_ts), "
+            "'' AS business_month "
             f"FROM ({_sql('silver', entity.name + '.sql')}) WHERE false"
         )
         _lake_view(conn, lake, "silver", entity.name, f"silver_{entity.name}", empty)
@@ -295,40 +295,14 @@ def build_gold(conn, lake: Lake, watermark: date) -> dict[str, dict[str, int]]:
     conn.execute(
         "CREATE OR REPLACE TEMP VIEW quarantine_facts AS " + _sql("gold", "quarantine_facts.sql")
     )
+    lake.file_versions(conn)
     checks = []
     for header, sql in _sections(_sql("gold", "recon_checks.sql"), "check"):
         name, *options = (part.strip() for part in header.split("|"))
         opts = dict(o.split("=", 1) for o in options)
-        # effect=<feed>:<effect>, ... : how losing one record of that feed moves the variance
-        # (actual - expected). <effect> is +measure or -measure (e.g. +units), +? or -? when
-        # only the direction is known, or ? when even that is not.
-        effects = [e.strip().split(":") for e in opts["effect"].split(",")]
-        related = ", ".join(f"'{feed}'" for feed, _ in effects)
-
-        def size_sql(eff: str) -> str:
-            if eff.endswith("?"):
-                return "NULL"
-            return f"{'-' if eff[0] == '-' else ''}q.{eff[1:]}"
-
-        def direction(eff: str) -> int:
-            return {"+": 1, "-": -1}.get(eff[0], 0) if eff != "?" else 0
-
-        def bound_sql(eff: str) -> str:
-            return "q.units_bound" if eff[1:] == "units_recovered" else "NULL"
-
-        size = " ".join(f"WHEN q._source = '{f}' THEN {size_sql(e)}" for f, e in effects)
-        bound = " ".join(f"WHEN q._source = '{f}' THEN {bound_sql(e)}" for f, e in effects)
-        sign = " ".join(f"WHEN q._source = '{f}' THEN {direction(e)}" for f, e in effects)
+        related = ", ".join(f"'{s.strip()}'" for s in opts["sources"].split(","))
         key = opts["key"]
         key_match = "TRUE" if key == "any" else f"(q.{key} IS NULL OR q.{key} = c.key)"
-        # A record whose key is known certainly belongs to this row; one whose key could not
-        # be recovered may or may not.
-        key_known = "TRUE" if key == "any" else f"q.{key} IS NOT NULL"
-        related_rows = f"""FROM quarantine_facts q
-                           WHERE q._source IN ({related}) AND {key_match} AND NOT q.released
-                             AND q.business_date
-                                 BETWEEN coalesce(c.window_start, c.business_date)
-                                     AND c.business_date"""
         checks.append(
             f"""SELECT '{name}' AS check_name, c.business_date, c.key,
                        CAST(c.expected AS DECIMAL(38, 2)) AS expected,
@@ -337,64 +311,57 @@ def build_gold(conn, lake: Lake, watermark: date) -> dict[str, dict[str, int]]:
                        e.*
                 FROM ({sql}) c,
                 LATERAL (
-                    SELECT count(*) AS related_quarantined,
-                           -- certainly (known key), possibly (unknown key), or of unknown size
-                           coalesce(sum(x) FILTER (WHERE known AND x IS NOT NULL), 0)
-                               AS quarantine_effect,
-                           list(x) FILTER (WHERE NOT known AND x IS NOT NULL)
-                               AS possible_effects,
-                           count(*) FILTER (WHERE x IS NULL) AS unsized_records,
-                           list(DISTINCT d) FILTER (WHERE x IS NULL) AS unsized_directions,
-                           -- the most the uncertain records could move the variance;
-                           -- NULL if some unsized record has no bound at all
-                           CASE WHEN count(*) FILTER (WHERE x IS NULL AND b IS NULL) > 0
-                                THEN NULL
-                                ELSE coalesce(sum(b) FILTER (WHERE x IS NULL), 0)
-                                     + coalesce(sum(abs(x)) FILTER (WHERE NOT known), 0)
-                           END AS uncertainty_bound
-                    FROM (SELECT CASE {size} END AS x, CASE {sign} END AS d,
-                                 CASE {bound} END AS b, {key_known} AS known
-                          {related_rows})
+                    -- Evidence for triage: open quarantined records that might account for
+                    -- the variance. They never change the row's status.
+                    SELECT count(*) AS candidate_records,
+                           list(q._file || '#' || q._record_number || ' ' || q.reject_reason
+                                ORDER BY q._file, q._record_number) AS candidates
+                    FROM quarantine_facts q
+                    WHERE q._source IN ({related}) AND {key_match} AND NOT q.released
+                      AND q.business_date
+                          BETWEEN coalesce(c.window_start, c.business_date) AND c.business_date
                 ) e"""
         )
     conn.execute(
         f"""CREATE OR REPLACE TEMP TABLE recon_results AS
             SELECT *,
                    CASE WHEN variance = 0 THEN 'matched'
-                        -- Explained only if it adds up exactly.
-                        WHEN related_quarantined > 0 AND unsized_records = 0
-                             AND coalesce(len(possible_effects), 0) <= {MAX_OPTIONAL_EFFECTS}
-                             AND subset_sum_matches(quarantine_effect, possible_effects,
-                                                    variance)
-                            THEN 'explained_by_quarantine'
                         WHEN business_date > DATE '{watermark}' - {LATE_ARRIVAL_WINDOW_DAYS}
                             THEN 'open_late_window'
-                        -- Plausibly caused by quarantined records whose size is unknown (but
-                        -- whose direction and bound fit), or by too many candidates to check:
-                        -- a person has to look. Never silently "explained".
-                        WHEN related_quarantined > 0
-                             AND ((unsized_records > 0
-                                   AND (list_contains(unsized_directions, 0)
-                                        OR list_contains(unsized_directions,
-                                                         sign(variance - quarantine_effect))))
-                                  OR len(possible_effects) > {MAX_OPTIONAL_EFFECTS})
-                             AND (uncertainty_bound IS NULL
-                                  OR abs(variance - quarantine_effect) <= uncertainty_bound)
-                            THEN 'needs_review'
                         ELSE 'exception'
                    END AS status
             FROM ({" UNION ALL ".join(checks)})
             ORDER BY check_name, business_date, key"""
     )
     tables.append("recon_results")
+    # What changed since the previous run, keyed on (check, date, key).
+    previous = lake.layer_glob("gold", "recon_results")
+    prev_sql = (
+        f"SELECT check_name, business_date, key, status FROM read_parquet('{previous}')"
+        if previous
+        else "SELECT NULL::VARCHAR AS check_name, NULL::DATE AS business_date, "
+        "NULL::VARCHAR AS key, NULL::VARCHAR AS status WHERE false"
+    )
+    conn.execute(
+        f"""CREATE OR REPLACE TEMP TABLE recon_changes AS
+            SELECT coalesce(n.check_name, o.check_name) AS check_name,
+                   coalesce(n.business_date, o.business_date) AS business_date,
+                   coalesce(n.key, o.key) AS key,
+                   o.status AS previous_status, n.status AS status
+            FROM recon_results n
+            FULL OUTER JOIN ({prev_sql}) o USING (check_name, business_date, key)
+            WHERE n.status IS DISTINCT FROM o.status
+            ORDER BY ALL"""
+    )
+    tables.append("recon_changes")
     conn.execute(
         """CREATE OR REPLACE TEMP TABLE recon_summary AS
            SELECT check_name, count(*) AS rows,
                   count(*) FILTER (WHERE status = 'matched') AS matched,
-                  count(*) FILTER (WHERE status = 'explained_by_quarantine') AS explained,
                   count(*) FILTER (WHERE status = 'open_late_window') AS open,
-                  count(*) FILTER (WHERE status = 'needs_review') AS needs_review,
-                  count(*) FILTER (WHERE status = 'exception') AS exceptions
+                  count(*) FILTER (WHERE status = 'exception') AS exceptions,
+                  count(*) FILTER (WHERE status = 'exception' AND candidate_records > 0)
+                      AS exceptions_with_evidence
            FROM recon_results GROUP BY check_name ORDER BY check_name"""
     )
     tables.append("recon_summary")
@@ -408,17 +375,18 @@ def build_gold(conn, lake: Lake, watermark: date) -> dict[str, dict[str, int]]:
 
     for table in tables:
         atomic_copy(conn, f"SELECT * FROM {table}", lake.gold_file(table))
-    return {
-        name: {
-            "rows": rows,
-            "matched": m,
-            "explained": e,
-            "open": o,
-            "needs_review": r,
-            "exceptions": x,
-        }
-        for name, rows, m, e, o, r, x in conn.execute("SELECT * FROM recon_summary").fetchall()
+    summary = {
+        name: {"rows": rows, "matched": m, "open": o, "exceptions": x, "with_evidence": ev}
+        for name, rows, m, o, x, ev in conn.execute("SELECT * FROM recon_summary").fetchall()
     }
+    changes = conn.execute(
+        """SELECT count(*) FILTER (WHERE status = 'exception'
+                                   AND previous_status IS DISTINCT FROM 'exception'),
+                  count(*) FILTER (WHERE previous_status = 'exception'
+                                   AND status IS DISTINCT FROM 'exception')
+           FROM recon_changes"""
+    ).fetchone()
+    return summary, {"new_exceptions": changes[0], "cleared_exceptions": changes[1]}
 
 
 def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) -> RunSummary:
@@ -437,7 +405,7 @@ def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) ->
             lake.current_versions(conn)
             entities = build_silver(conn, lake)
             watermark = lake.watermark(conn) or date.min
-            recon = build_gold(conn, lake, watermark)
+            recon, changes = build_gold(conn, lake, watermark)
         finally:
             conn.close()
         lake.write_catalog()
@@ -449,4 +417,5 @@ def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) ->
         watermark=watermark,
         entities=entities,
         recon=recon,
+        changes=changes,
     )

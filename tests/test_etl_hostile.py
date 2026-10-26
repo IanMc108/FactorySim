@@ -1,15 +1,18 @@
 """Hostile inputs outside the exporter's defect catalog.
 
-Each case reproduces a failure found by adversarial review round 1 (docs/review-log.md)
+Each case reproduces a failure found in an adversarial review round (docs/review-log.md)
 and pins the fixed behaviour. None of these inputs can come from the exporter, so they
 check the pipeline's rules rather than its agreement with the generator.
 """
 
 import os
+import shutil
 from datetime import date
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from factorysim.etl.pipeline import run_pipeline
@@ -142,7 +145,7 @@ def test_double_and_late_supplier_payments_are_exceptions(tmp_path):
     ]
 
 
-def test_quarantine_explains_only_matching_variances(tmp_path):
+def test_evidence_matches_on_key(tmp_path):
     land(
         tmp_path,
         "mes_production",
@@ -161,8 +164,9 @@ def test_quarantine_explains_only_matching_variances(tmp_path):
     )
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
-    # A junk MPU-XL-A row cannot explain a million-unit SUB-PE billing variance.
+    # A junk MPU-XL-A row is not evidence for a million-unit SUB-PE billing variance.
     assert ("SUB-PE", 10, 1000010, "exception") in recon(tmp_path, "production_vs_sales")
+    assert evidence(tmp_path, "production_vs_sales", "SUB-PE") == ("exception", 0)
 
 
 def test_file_version_replaces_all_records_of_the_old_version(tmp_path):
@@ -287,7 +291,7 @@ def test_bad_files_are_rejected_without_stopping_the_batch(tmp_path):
     ) == [(1,)]
 
 
-def test_crash_leftovers_are_cleaned_and_lost_bronze_is_rebuilt(tmp_path):
+def test_lost_control_table_is_rebuilt_from_bronze_and_bronze_is_never_deleted(tmp_path):
     land(
         tmp_path,
         "erp_invoices",
@@ -297,18 +301,25 @@ def test_crash_leftovers_are_cleaned_and_lost_bronze_is_rebuilt(tmp_path):
     )
     run(tmp_path)
     bronze = next((tmp_path / "lake/bronze/erp_invoices").rglob("*.parquet"))
-    # A crash after writing bronze but before logging it leaves an unlogged file behind.
-    orphan = bronze.parent / "erp_invoices_20250305__000000000000.parquet"
-    orphan.write_bytes(bronze.read_bytes())
+    count = "SELECT count(*) FROM read_parquet('@/silver/invoice_lines/*/*.parquet')"
+    # The ingest log is lost (or a crash hit between writing bronze and logging it). The
+    # bronze file carries its own ingest metadata, so the log entry is rebuilt from it and
+    # the landed file is not loaded a second time.
+    shutil.rmtree(tmp_path / "lake/_control/ingest_log")
+    summary = run(tmp_path)
+    assert bronze.exists() and summary.files_loaded == 0
+    assert rows(tmp_path, count) == [(1,)]
+    # A bronze file nobody can account for is set aside for a person, not deleted.
+    stray = bronze.parent / "erp_invoices_20250305__000000000000.parquet"
+    pq.write_table(pa.table({"x": [1]}), stray)
     run(tmp_path)
-    assert not orphan.exists()
+    assert not stray.exists()
+    assert (tmp_path / "lake/_orphaned" / stray.relative_to(tmp_path / "lake")).exists()
     # A logged bronze file that has gone missing is rebuilt from the landing zone.
     bronze.unlink()
     run(tmp_path)
     assert bronze.exists()
-    assert rows(
-        tmp_path, "SELECT count(*) FROM read_parquet('@/silver/invoice_lines/*/*.parquet')"
-    ) == [(1,)]
+    assert rows(tmp_path, count) == [(1,)]
 
 
 def test_numbers_are_parsed_strictly(tmp_path):
@@ -374,13 +385,24 @@ def recon_status(root: Path, check: str, key: str) -> str:
     return found[0]
 
 
+def evidence(root: Path, check: str, key: str) -> tuple[str, int]:
+    """(status, number of quarantined records attached as evidence) of one recon row."""
+    found = rows(
+        root,
+        "SELECT status, candidate_records FROM read_parquet('@/gold/recon_results/*.parquet') "
+        f"WHERE check_name = '{check}' AND key = '{key}'",
+    )
+    assert len(found) == 1, (check, key, recon(root, check))
+    return found[0]
+
+
 def silver(root: Path, entity: str, columns: str) -> list[tuple]:
     return rows(
         root, f"SELECT {columns} FROM read_parquet('@/silver/{entity}/*/*.parquet') ORDER BY ALL"
     )
 
 
-def test_unsized_quarantine_never_explains_and_is_bounded(tmp_path):
+def test_quarantine_is_evidence_and_never_clears_a_variance(tmp_path):
     # Two MES rows with unreadable quantities at CHEM-A (20 units issued but not produced),
     # and an invoice that bills a million units more than anything produced.
     land(
@@ -409,13 +431,15 @@ def test_unsized_quarantine_never_explains_and_is_bounded(tmp_path):
     )
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
-    # The lost rows really can explain the mass-balance gap, but nobody can confirm it.
-    assert recon_status(tmp_path, "mass_balance", "CHEM-A") == "needs_review"
-    # They cannot be more than the 20-unit gap, so the billing variance is an exception.
-    assert recon_status(tmp_path, "production_vs_sales", "SUB-PE") == "exception"
+    # The lost rows may well account for the 20-unit mass-balance gap, but that is for a
+    # person to decide: the row is an exception with both records attached.
+    assert evidence(tmp_path, "mass_balance", "CHEM-A") == ("exception", 2)
+    # The same records are attached to the billing variance, which they cannot explain;
+    # attaching them changes nothing about its status.
+    assert evidence(tmp_path, "production_vs_sales", "SUB-PE") == ("exception", 2)
 
 
-def test_unknown_key_quarantine_explains_only_an_exact_match(tmp_path):
+def test_quarantine_of_unknown_key_is_evidence_for_any_key(tmp_path):
     land(
         tmp_path,
         "mes_production",
@@ -431,10 +455,10 @@ def test_unknown_key_quarantine_explains_only_an_exact_match(tmp_path):
         INVOICES
         + "INV-1,INV,,03/04/2025,C1,1,SUB-PE,6,250,1500,USD\n"
         + "INV-1,INV,,03/04/2025,C1,2,SUB-XX,4,250,1000,USD\n",
-    )  # unknown SKU, qty 4
+    )  # unknown SKU, qty 4: it could be the missing SUB-PE billing, nobody can tell
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
-    assert recon_status(tmp_path, "production_vs_sales", "SUB-PE") == "explained_by_quarantine"
+    assert evidence(tmp_path, "production_vs_sales", "SUB-PE") == ("exception", 1)
 
 
 def test_quarantine_is_released_when_its_key_loads_later(tmp_path):
@@ -447,7 +471,7 @@ def test_quarantine_is_released_when_its_key_loads_later(tmp_path):
     )
     # Line 2 is rejected (its amount is wrong) and re-sent correctly the next day. 30 units
     # were made and only 20 billed: a real 10-unit under-billing that the stale quarantined
-    # copy of line 2 (effect -10) must not "explain".
+    # copy of line 2 must not be offered as the reason.
     land(
         tmp_path,
         "erp_invoices",
@@ -466,7 +490,8 @@ def test_quarantine_is_released_when_its_key_loads_later(tmp_path):
     )
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
-    assert recon_status(tmp_path, "production_vs_sales", "SUB-PE") == "exception"
+    # The re-sent line accounts for the rejected one, so it is not offered as evidence.
+    assert evidence(tmp_path, "production_vs_sales", "SUB-PE") == ("exception", 0)
     assert rows(
         tmp_path,
         "SELECT records, released_by_later_load FROM "
@@ -474,7 +499,7 @@ def test_quarantine_is_released_when_its_key_loads_later(tmp_path):
     ) == [(1, 1)]
 
 
-def test_quarantined_invoice_amount_explains_a_deposit_gap_exactly(tmp_path):
+def test_quarantined_invoice_is_evidence_for_a_deposit_gap(tmp_path):
     land(
         tmp_path,
         "erp_invoices",
@@ -495,7 +520,7 @@ def test_quarantined_invoice_amount_explains_a_deposit_gap_exactly(tmp_path):
     )
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
-    assert recon_status(tmp_path, "customer_receipts", "ALL") == "explained_by_quarantine"
+    assert evidence(tmp_path, "customer_receipts", "ALL") == ("exception", 1)
 
 
 def test_quarantined_record_is_dated_by_its_own_date(tmp_path):
@@ -523,7 +548,7 @@ def test_quarantined_record_is_dated_by_its_own_date(tmp_path):
         "snapshot_date,material,on_hand,uom\n2025-09-30,PR-POLY,1,EA\n",
     )
     run(tmp_path)
-    assert recon_status(tmp_path, "production_vs_sales", "SUB-PE") == "exception"
+    assert evidence(tmp_path, "production_vs_sales", "SUB-PE") == ("exception", 0)
 
 
 def test_partial_deliveries_and_payment_terms_boundary(tmp_path):
@@ -629,7 +654,7 @@ def test_night_shift_cutoff(tmp_path):
     ]
 
 
-def test_mass_balance_explanations_match_on_station(tmp_path):
+def test_mass_balance_evidence_matches_on_station(tmp_path):
     land(
         tmp_path,
         "mes_material_issues",
@@ -648,7 +673,7 @@ def test_mass_balance_explanations_match_on_station(tmp_path):
     )  # other station
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
-    assert recon_status(tmp_path, "mass_balance", "CHEM-A") == "exception"
+    assert evidence(tmp_path, "mass_balance", "CHEM-A") == ("exception", 0)
 
 
 def test_file_versions_follow_arrival_order(tmp_path):
@@ -813,7 +838,7 @@ def test_values_are_not_guessed(tmp_path):
     ]
 
 
-def test_unsized_quarantine_must_point_the_right_way(tmp_path):
+def test_deposit_gap_with_an_unreadable_deposit_line_stays_an_exception(tmp_path):
     land(
         tmp_path,
         "erp_invoices",
@@ -821,8 +846,6 @@ def test_unsized_quarantine_must_point_the_right_way(tmp_path):
         "erp_invoices_20250304.csv",
         INVOICES + "INV-1,INV,,03/04/2025,C1,1,SUB-PE,4,250,1000,USD\n",
     )
-    # Deposits exceed invoices by 4,000. A deposit line with an unreadable amount can only
-    # have lowered deposits, so it cannot account for that.
     land(
         tmp_path,
         "bank_statements",
@@ -835,4 +858,278 @@ def test_unsized_quarantine_must_point_the_right_way(tmp_path):
     )
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
-    assert recon_status(tmp_path, "customer_receipts", "ALL") == "exception"
+    assert evidence(tmp_path, "customer_receipts", "ALL") == ("exception", 1)
+
+
+# ---------------------------------------------------------------------------- round 3
+
+
+def test_unreferenced_bank_debit_and_balance_jump_are_exceptions(tmp_path):
+    # A debit nobody can tie to a PO or work order, with the bank's own balances
+    # consistent around it; and a next-day BALANCE FORWARD that does not carry the
+    # previous close forward.
+    land(
+        tmp_path,
+        "bank_statements",
+        "2025-03-04",
+        "bank_statement_20250304.csv",
+        BANK + '03/04/2025,BALANCE FORWARD,,,"100,000.00"\r\n'
+        '03/04/2025,ACH DEBIT GLOBEX TRADING LLC 88123,"25,000.00",,"75,000.00"\r\n',
+        "cp1252",
+    )
+    land(
+        tmp_path,
+        "bank_statements",
+        "2025-03-05",
+        "bank_statement_20250305.csv",
+        BANK + '03/05/2025,BALANCE FORWARD,,,"1,075,000.00"\r\n',
+        "cp1252",
+    )
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    assert recon(tmp_path, "unreferenced_bank_lines") == [
+        (
+            "bank_statement_20250304.csv#3: ACH DEBIT GLOBEX TRADING LLC 88123",
+            0,
+            -25000,
+            "exception",
+        )
+    ]
+    continuity = {k: s for k, _, _, s in recon(tmp_path, "bank_balance_continuity")}
+    assert continuity == {
+        "bank_statement_20250304.csv#3: ACH DEBIT GLOBEX TRADING LLC 88123": "matched",
+        "bank_statement_20250305.csv#2: BALANCE FORWARD": "exception",
+    }
+
+
+@pytest.mark.parametrize("correction_lands_first", [False, True])
+def test_same_day_extracts_are_ordered_by_arrival_time(tmp_path, correction_lands_first):
+    """Two extracts of the same day land in one folder, on either side of a run.
+
+    The one that arrived later (by its timestamp) wins, whatever its name and whichever
+    the incremental run happened to see first, so incremental and full runs agree.
+    """
+    line = "INV-1,INV,,03/10/2025,C1,1,SUB-PE,{q},250,{a},USD\n"
+    files = [
+        # A 15:00 re-extract, under a name that sorts before the original.
+        ("erp_invoices_1500_20250310.csv", line.format(q=5, a=1250), 1741618800),
+        # The 09:46 original; when it lands second, it was delivered late, mtime preserved.
+        ("erp_invoices_20250310.csv", line.format(q=4, a=1000), 1741600000),
+    ]
+    if not correction_lands_first:
+        files.reverse()
+    for name, body, ts in files:
+        path = land(tmp_path, "erp_invoices", "2025-03-10", name, INVOICES + body)
+        os.utime(path, (ts, ts))
+        run(tmp_path, lake="incremental")
+    run(tmp_path, lake="full")
+    sql = "SELECT qty FROM read_parquet('@/silver/invoice_lines/*/*.parquet')"
+    assert rows(tmp_path, sql, "incremental") == rows(tmp_path, sql, "full") == [(5,)]
+
+
+def test_empty_redelivery_is_rejected_and_a_shrinking_reissue_is_flagged(tmp_path):
+    snapshot = "snapshot_date,material,on_hand,uom\n"
+    land(
+        tmp_path,
+        "erp_stock_snapshots",
+        "2025-03-09",
+        "erp_stock_20250309.csv",
+        snapshot + "2025-03-09,PR-POLY,10,EA\n2025-03-09,SI-WFR-300,20,EA\n",
+    )
+    run(tmp_path)
+    # A failed re-upload leaves a 0-byte copy in a later folder: rejected, data kept.
+    land(tmp_path, "erp_stock_snapshots", "2025-03-21", "erp_stock_20250309.csv", "")
+    summary = run(tmp_path)
+    assert summary.rejected_files[0][0].endswith("2025/03/21/erp_stock_20250309.csv")
+    count = "SELECT count(*) FROM read_parquet('@/silver/stock_snapshots/*/*.parquet')"
+    assert rows(tmp_path, count) == [(2,)]
+    assert recon(tmp_path, "file_version_shrink") == []
+    # A readable re-issue with fewer records replaces the old one, and is raised.
+    land(
+        tmp_path,
+        "erp_stock_snapshots",
+        "2025-03-22",
+        "erp_stock_20250309.csv",
+        snapshot + "2025-03-09,PR-POLY,10,EA\n",
+    )
+    run(tmp_path)
+    assert rows(tmp_path, count) == [(1,)]
+    assert recon(tmp_path, "file_version_shrink") == [("erp_stock_20250309.csv", 2, 1, "exception")]
+
+
+def test_implausible_files_are_rejected_and_do_not_move_the_watermark(tmp_path):
+    land(tmp_path, *LATE_SNAPSHOT)
+    assert run(tmp_path).watermark == date(2025, 6, 30)
+    # Junk in a far-future folder, and a real-looking file that "arrived" a year after
+    # its business date, are rejected; neither moves the late-arrival window.
+    land(tmp_path, "cmms_work_orders", "2026-12-31", "notes.txt", "hello")
+    land(
+        tmp_path,
+        "erp_stock_snapshots",
+        "2026-07-01",
+        "erp_stock_20250701.csv",
+        "snapshot_date,material,on_hand,uom\n2025-07-01,PR-POLY,1,EA\n",
+    )
+    summary = run(tmp_path)
+    assert len(summary.rejected_files) == 2
+    assert summary.watermark == date(2025, 6, 30)
+
+
+def test_same_size_correction_with_preserved_mtime_is_loaded(tmp_path):
+    line = "INV-1,INV,,03/04/2025,C1,1,SUB-PE,{q},250,{a},USD\n"
+    path = land(
+        tmp_path,
+        "erp_invoices",
+        "2025-03-04",
+        "erp_invoices_20250304.csv",
+        INVOICES + line.format(q=4, a="1000.00"),
+    )
+    run(tmp_path)
+    # `cp -p`, `rsync -t` and S3 sync from a mirror keep the old mtime: size and mtime
+    # match, but the change time does not.
+    st = path.stat()
+    path.write_text(INVOICES + line.format(q=5, a="1250.00"))
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert path.stat().st_size == st.st_size
+    assert run(tmp_path).files_loaded == 1
+    assert rows(tmp_path, "SELECT qty FROM read_parquet('@/silver/invoice_lines/*/*.parquet')") == [
+        (5,)
+    ]
+
+
+def test_quarantined_newer_revision_is_not_released_by_an_older_one(tmp_path):
+    land(
+        tmp_path,
+        "mes_material_issues",
+        "2025-03-10",
+        "mes_material_issues_20250310.csv",
+        ISSUES + "I1,2025-03-10 06:05:00,LITHO-A,A,SI-WFR-300,40,EA\n",
+    )
+    land(
+        tmp_path,
+        "mes_production",
+        "2025-03-10",
+        "mes_production_20250310.csv",
+        MES_V1 + "P1,1,2025-03-10 09:00:00,LITHO-A,A,L1,MPU-XL-SCRAP,36,op1,\n",
+    )
+    # Revision 2 corrects the quantity but carries an unknown station, so it is quarantined.
+    land(
+        tmp_path,
+        "mes_production",
+        "2025-03-11",
+        "mes_production_20250311.csv",
+        MES_V1 + "P1,2,2025-03-10 09:00:00,LITHO-AA,A,L1,MPU-XL-SCRAP,40,op1,\n",
+    )
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    assert silver(tmp_path, "production_events", "revision, qty") == [(1, 36)]
+    # The stale revision 1 in silver does not account for it: it stays evidence.
+    assert evidence(tmp_path, "mass_balance", "LITHO-A") == ("exception", 1)
+    assert rows(
+        tmp_path,
+        "SELECT sum(released_by_later_load) FROM "
+        "read_parquet('@/gold/dq_quarantine_summary/*.parquet')",
+    ) == [(0,)]
+
+
+def test_missing_shift_and_bad_digit_grouping_are_quarantined(tmp_path):
+    land(
+        tmp_path,
+        "mes_material_issues",
+        "2025-03-11",
+        "mes_material_issues_20250311.csv",
+        "issue_id,issue_time_local,station,material,qty,uom\n"
+        "I1,2025-03-11 06:22:01,LITHO-A,SI-WFR-300,47,EA\n",
+    )  # no shift column at all
+    land(
+        tmp_path,
+        "erp_goods_receipts",
+        "2025-03-11",
+        "erp_goods_receipts_20250311.csv",
+        RECEIPTS + 'GR-1,PO-1,2025-03-11,PR-POLY,10,EA,100,"1,0000.00"\n',
+    )
+    run(tmp_path)
+    assert rows(
+        tmp_path,
+        "SELECT reject_reason FROM read_parquet('@/quarantine/*/*/*.parquet') ORDER BY ALL",
+    ) == [("invalid_amount",), ("invalid_shift",)]
+
+
+def test_cli_exit_codes_signal_rejected_files_and_new_exceptions(tmp_path, capsys):
+    from factorysim.cli import main
+
+    land(tmp_path, *LATE_SNAPSHOT)
+    land(tmp_path, "cmms_work_orders", "2025-06-30", "notes.txt", "hello")
+    args = ["etl", "--landing", str(tmp_path / "landing"), "--lake", str(tmp_path / "lake")]
+    with pytest.raises(SystemExit) as exit_info:
+        main(args)
+    assert exit_info.value.code == 3
+    assert "REJECTED" in capsys.readouterr().out
+    land(
+        tmp_path,
+        "erp_invoices",
+        "2025-03-04",
+        "erp_invoices_20250304.csv",
+        INVOICES + "INV-1,INV,,03/04/2025,C1,1,SUB-PE,4,250,1000,USD\n",
+    )  # billed, never produced: a new exception
+    with pytest.raises(SystemExit) as exit_info:
+        main([*args, "--fail-on-new-exceptions"])
+    assert exit_info.value.code == 2
+    main([*args, "--fail-on-new-exceptions"])  # nothing new: exits normally
+
+
+def test_overwrite_with_an_older_timestamp_is_the_current_version(tmp_path):
+    """A file overwritten in place by an older copy (restored with `cp -p`) is what is there."""
+    line = "INV-1,INV,,03/10/2025,C1,1,SUB-PE,{q},250,{a},USD\n"
+    for q, a, ts in ((5, 1250, 1741618800), (4, 1000, 1741600000)):
+        path = land(
+            tmp_path,
+            "erp_invoices",
+            "2025-03-10",
+            "erp_invoices_20250310.csv",
+            INVOICES + line.format(q=q, a=a),
+        )
+        os.utime(path, (ts, ts))
+        run(tmp_path, lake="incremental")
+    run(tmp_path, lake="full")
+    sql = "SELECT qty FROM read_parquet('@/silver/invoice_lines/*/*.parquet')"
+    assert rows(tmp_path, sql, "incremental") == rows(tmp_path, sql, "full") == [(4,)]
+
+
+def test_release_needs_a_load_at_least_as_new_on_every_count(tmp_path):
+    # Revision 1 and 2 of one event in the same file; revision 2 has an unknown station.
+    land(
+        tmp_path,
+        "mes_production",
+        "2025-03-10",
+        "mes_production_20250310.csv",
+        MES_V1
+        + "P1,1,2025-03-10 09:00:00,LITHO-A,A,L1,MPU-XL-SCRAP,36,op1,\n"
+        + "P1,2,2025-03-10 09:00:00,LITHO-AA,A,L1,MPU-XL-SCRAP,40,op1,\n",
+    )
+    # Invoice line 2 is fine in the first extract and broken in the re-extract (stale data
+    # stays loaded); line 3 is broken in the first and fixed in the re-extract (released).
+    land(
+        tmp_path,
+        "erp_invoices",
+        "2025-03-04",
+        "erp_invoices_20250304.csv",
+        INVOICES
+        + "INV-1,INV,,03/04/2025,C1,2,SUB-PE,4,250,1000,USD\n"
+        + "INV-1,INV,,03/04/2025,C1,3,SUB-PE,4,250,9999,USD\n",
+    )
+    land(
+        tmp_path,
+        "erp_invoices",
+        "2025-03-05",
+        "erp_invoices_20250305.csv",
+        INVOICES
+        + "INV-1,INV,,03/04/2025,C1,2,SUB-PE,4,250,9999,USD\n"
+        + "INV-1,INV,,03/04/2025,C1,3,SUB-PE,4,250,1000,USD\n",
+    )
+    run(tmp_path)
+    assert rows(
+        tmp_path,
+        "SELECT source, sum(records)::INT, sum(released_by_later_load)::INT FROM "
+        "read_parquet('@/gold/dq_quarantine_summary/*.parquet') GROUP BY ALL ORDER BY ALL",
+    ) == [("erp_invoices", 2, 1), ("mes_production", 1, 0)]

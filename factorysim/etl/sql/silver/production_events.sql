@@ -45,7 +45,8 @@ resolved AS (
     LEFT JOIN ref_sku_aliases k ON k.alias = p.sku_raw
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _arrival_ts, _ingest_seq,
+    _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN event_id IS NULL THEN 'missing_key'

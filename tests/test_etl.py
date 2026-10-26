@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import json
 from datetime import date
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from factorysim.etl.pipeline import ENTITIES, run_pipeline
 from factorysim.report import build_etl_results, sweep_summary
 from factorysim.simulation import run_simulation
 from factorysim.sources.export import export_sources
+
+DOCS = Path(__file__).resolve().parent.parent / "docs"
 
 GOLD_TABLES = (
     "fct_production_daily",
@@ -71,7 +74,11 @@ def test_gold_matches_truth_except_for_injected_losses(full_year):
 def test_reconciliation_flags_only_business_errors(full_year):
     r = full_year[2]["reconciliation"]
     assert r["unexpected_exceptions"] == []
-    assert r["business_errors_flagged"] == r["expected_business_errors"] > 0
+    assert r["business_errors_missed"] == []
+    assert r["business_errors_caught"] + r["business_errors_open"] == r["expected_business_errors"]
+    assert r["business_errors_caught"] > 0
+    # Every row a lost record lands in is raised, with the lost record attached as evidence.
+    assert r["data_loss_rows_with_evidence"] == r["expected_data_loss_rows"] > 0
 
 
 def test_another_defect_seed_is_handled_as_well(tmp_path):
@@ -79,9 +86,14 @@ def test_another_defect_seed_is_handled_as_well(tmp_path):
     summary = sweep_summary(build_etl_results(tmp_path, defect_seed=3))
     assert summary["defects_handled"] == summary["defects_injected"]
     assert summary["quarantine_precision"] == summary["quarantine_recall"] == 1
-    assert summary["business_errors_flagged"] == summary["business_errors"] > 0
-    assert summary["masked_by_quarantine"] == summary["unexpected_exceptions"] == 0
-    assert summary["unexplained_cells"] == 0
+    caught = summary["business_errors_caught"] + summary["business_errors_open"]
+    assert caught == summary["business_errors"] > 0
+    assert summary["data_loss_rows_flagged_with_evidence"] == summary["data_loss_rows"] > 0
+    assert summary["unexpected_exceptions"] == summary["unexplained_cells"] == 0
+    # The published sweep table must be what the current code produces, not a stale run.
+    published = json.loads((DOCS / "etl_seed_sweep.json").read_text(encoding="utf-8"))
+    row = next(r for r in published if r["defect_seed"] == 3 and r["batches"] == 1)
+    assert row == summary
 
 
 def test_rerun_without_new_files_changes_nothing(full_year, tmp_path):

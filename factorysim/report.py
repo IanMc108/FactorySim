@@ -7,6 +7,8 @@ from dataclasses import asdict, replace
 from datetime import date, timedelta
 from pathlib import Path
 
+import duckdb
+
 from .analysis import CostModel, IntervalResult, compare_intervals, reference_model
 from .config import SimConfig
 from .db import create_database
@@ -286,15 +288,50 @@ def build_etl_results(build: Path, defect_seed: int = 7, batch_days: int | None 
         )
     finally:
         conn.close()
+    # In batched mode, remember when each exception was first raised, to measure alarms
+    # that later cleared and how long business errors took to surface.
+    first_raised: dict[tuple, date] = {}
     if batch_days:
         through = date(2025, 1, 1)
         while through < date(2026, 1, 15):
             run_pipeline(build / "landing", build / "lake", through)
+            for check, day, key in (
+                duckdb.connect()
+                .execute(
+                    "SELECT check_name, business_date, key FROM read_parquet("
+                    f"'{build / 'lake' / 'gold' / 'recon_results' / '*.parquet'}') "
+                    "WHERE status = 'exception'"
+                )
+                .fetchall()
+            ):
+                first_raised.setdefault((check, str(day), key), through)
             through += timedelta(days=batch_days)
     run = run_pipeline(build / "landing", build / "lake")
     evaluation = evaluate(
         build / "truth" / "factory.db", build / "truth" / "defects.jsonl", build / "lake"
     )
+    if batch_days:
+        final = {
+            tuple(map(str, r))
+            for r in duckdb.connect()
+            .execute(
+                "SELECT check_name, business_date, key FROM read_parquet("
+                f"'{build / 'lake' / 'gold' / 'recon_results' / '*.parquet'}') "
+                "WHERE status = 'exception'"
+            )
+            .fetchall()
+        }
+        delays = [
+            (first_raised[tuple(k)] - date.fromisoformat(k[1])).days
+            for k in evaluation["business_error_rows"]
+            if tuple(k) in first_raised
+        ]
+        evaluation["batched"] = {
+            "transient_exceptions": len(set(first_raised) - final),
+            "business_error_rows_raised": len(delays),
+            "max_days_to_raise": max(delays, default=None),
+            "median_days_to_raise": sorted(delays)[len(delays) // 2] if delays else None,
+        }
     return json.loads(
         json.dumps(
             {
@@ -319,19 +356,23 @@ def sweep_summary(results: dict) -> dict:
     ev = results["evaluation"]
     r, q = ev["reconciliation"], ev["quarantine"]
     data = [d for d in ev["defects"] if d["kind"] != "normalization"]
+    batched = ev.get("batched") or {}
     return {
         "defect_seed": results["defect_seed"],
         "batches": ev["batches"],
         "late_files_in_later_batch": ev["late_files_in_later_batch"],
+        "transient_exceptions": batched.get("transient_exceptions"),
+        "max_days_to_raise": batched.get("max_days_to_raise"),
         "defects_injected": sum(d["injected"] for d in data),
         "defects_handled": sum(d["handled"] for d in data),
         "quarantine_precision": q["precision"],
         "quarantine_recall": q["recall"],
         "business_errors": r["expected_business_errors"],
-        "business_errors_flagged": r["business_errors_flagged"],
-        "masked_by_quarantine": r["masked_by_quarantine"],
+        "business_errors_caught": r["business_errors_caught"],
+        "business_errors_open": r["business_errors_open"],
+        "data_loss_rows": r["expected_data_loss_rows"],
+        "data_loss_rows_flagged_with_evidence": r["data_loss_rows_with_evidence"],
         "unexpected_exceptions": len(r["unexpected_exceptions"]),
-        "rows_needing_review": r["rows_needing_review"],
         "unexplained_cells": sum(c["unexplained"] for c in ev["gold_vs_truth"].values()),
     }
 
@@ -390,26 +431,26 @@ def render_etl_block(results: dict, sweep: list[dict]) -> str:
         f"unrecoverable records, {q['correct_reason']} of {q['true_positives']} with the "
         "expected reason code.",
         "",
-        "| Reconciliation check | Rows | Matched | Explained by quarantine | Open (late window) "
-        "| Needs review | Exceptions |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Reconciliation check | Rows | Matched | Open (late window) | Exceptions "
+        "| ...with quarantine evidence |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
     for name, c in pipe["recon"].items():
         lines.append(
-            f"| `{name}` | {c['rows']:,} | {c['matched']:,} | {c['explained']} | "
-            f"{c['open']} | {c['needs_review']} | {c['exceptions']} |"
+            f"| `{name}` | {c['rows']:,} | {c['matched']:,} | {c['open']} | "
+            f"{c['exceptions']} | {c['with_evidence']} |"
         )
     lines += [
         "",
-        f"All {r['expected_business_errors']} reconciliation rows touched by an injected "
-        f"business error surface: {r['flagged_as_exception']} as exceptions, "
-        f"{r['flagged_for_review']} for review and "
-        f"{r['business_errors_flagged'] - r['flagged_as_exception'] - r['flagged_for_review']} "
-        "still open inside the late-arrival window at the end of the year. "
-        f'{r["masked_by_quarantine"]} are hidden as "explained", and '
-        f"{len(r['unexpected_exceptions'])} exceptions are not injected errors. The "
-        f"{r['rows_needing_review']} rows that need review are days where a quarantined record "
-        "of unknown size could account for the variance; a person has to confirm them.",
+        f"Every one of the {r['exceptions']} exceptions is accounted for: "
+        f"{r['business_errors_caught']} rows are injected business errors (caught; "
+        f"{r['business_errors_open']} more were still inside the late-arrival window at the "
+        "end of the year), and the rest are injected lost records, each flagged with the "
+        f"quarantined record attached ({r['data_loss_rows_with_evidence']} of "
+        f"{r['expected_data_loss_rows']} rows touched by a lost record). Exceptions with no "
+        f"injected cause: {len(r['unexpected_exceptions'])}. "
+        f"Business-error rows that also carry quarantine evidence from the same day, where an "
+        f"analyst has to look past it: {r['business_errors_with_evidence']}.",
         "",
         "**Gold vs. ground truth** (cells compared against the simulator's database):",
         "",
@@ -424,22 +465,29 @@ def render_etl_block(results: dict, sweep: list[dict]) -> str:
     lines += [
         "",
         f"**Robustness:** the same year for {len(sweep) - 1} defect seeds, plus the published "
-        f"seed run incrementally (the tables above are seed {results['defect_seed']}, one "
-        "batch):",
+        f"seed run as weekly incremental batches (the tables above are seed "
+        f"{results['defect_seed']}, one batch):",
         "",
-        "| Seed | Batches | Late files in a later batch | Defects handled | Quarantine P / R "
-        "| Business errors surfaced | Masked | Unexpected exceptions | Needs review "
-        "| Unexplained cells |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Seed | Batches | Late files in a later batch | Alarms raised then cleared "
+        "| Slowest business error (days) | Defects handled | Quarantine P / R "
+        "| Business errors caught (+ open) | Lost-record rows flagged with evidence "
+        "| Unexpected exceptions | Unexplained cells |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+
+    def dash(v):
+        return "–" if v is None else v
+
     for x in sweep:
         lines.append(
             f"| {x['defect_seed']} | {x['batches']} | {x['late_files_in_later_batch']} | "
+            f"{dash(x['transient_exceptions'])} | {dash(x['max_days_to_raise'])} | "
             f"{x['defects_handled']:,} / {x['defects_injected']:,} | "
             f"{x['quarantine_precision']:.0%} / {x['quarantine_recall']:.0%} | "
-            f"{x['business_errors_flagged']} / {x['business_errors']} | "
-            f"{x['masked_by_quarantine']} | {x['unexpected_exceptions']} | "
-            f"{x['rows_needing_review']} | {x['unexplained_cells']} |"
+            f"{x['business_errors_caught']} (+{x['business_errors_open']}) / "
+            f"{x['business_errors']} | "
+            f"{x['data_loss_rows_flagged_with_evidence']} / {x['data_loss_rows']} | "
+            f"{x['unexpected_exceptions']} | {x['unexplained_cells']} |"
         )
     lines += ["", ETL_END]
     return "\n".join(lines)
