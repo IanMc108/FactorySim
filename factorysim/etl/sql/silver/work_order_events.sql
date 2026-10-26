@@ -6,12 +6,12 @@ WITH parsed AS (
         upper(trim(record ->> 'event')) AS event,
         timezone('UTC', TRY_CAST(record ->> 'timestamp' AS TIMESTAMPTZ)) AS event_ts_utc,
         upper(trim(record ->> 'asset')) AS asset,
-        TRY_CAST(record -> 'cost' ->> 'amount' AS DECIMAL(18, 2)) AS cost,
+        money(record -> 'cost' ->> 'amount') AS cost,
         upper(record -> 'cost' ->> 'currency') AS currency
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN work_order IS NULL THEN 'missing_key'

@@ -4,7 +4,7 @@
     <lake>/silver/<entity>/business_month=YYYY-MM/part-0.parquet
     <lake>/quarantine/<source>/business_month=YYYY-MM/part-0.parquet
     <lake>/gold/<table>/part-0.parquet
-    <lake>/_control/ingest_log/batch_id=<id>.parquet
+    <lake>/_control/ingest_log/batch_id=<id>/<seq>.parquet   one entry per file version
     <lake>/catalog.duckdb   views over all of the above (rebuilt every run)
 
 Everything except catalog.duckdb is plain Parquet, so the layout maps directly onto S3
@@ -13,18 +13,57 @@ prefixes with the Glue Data Catalog in place of catalog.duckdb.
 
 from __future__ import annotations
 
-from datetime import date
+import os
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 if TYPE_CHECKING:
     from .ingest import IngestResult
 
 
+INGEST_LOG_SCHEMA = pa.schema(
+    [
+        ("batch_id", pa.string()),
+        ("seq", pa.int64()),
+        ("source", pa.string()),
+        ("file", pa.string()),
+        ("sha256", pa.string()),
+        ("arrival_date", pa.date32()),
+        ("file_business_date", pa.date32()),
+        ("status", pa.string()),
+        ("error", pa.string()),
+        ("encoding", pa.string()),
+        ("records", pa.int64()),
+        ("header_repeats", pa.int64()),
+        ("parse_errors", pa.int64()),
+        ("ingested_at", pa.timestamp("us")),
+    ]
+)
+
+
 def _q(path: Path | str) -> str:
     return str(path).replace("'", "''")
+
+
+def atomic_write_table(table: pa.Table, target: Path) -> None:
+    """Write Parquet to a temporary file, then rename it into place."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    pq.write_table(table, tmp, compression="zstd")
+    os.replace(tmp, target)
+
+
+def atomic_copy(conn: duckdb.DuckDBPyConnection, select_sql: str, target: Path) -> None:
+    """COPY a query result to Parquet via a temporary file and an atomic rename."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    conn.execute(f"COPY ({select_sql}) TO '{_q(tmp)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+    os.replace(tmp, target)
 
 
 class Lake:
@@ -63,71 +102,69 @@ class Lake:
 
     def _log_glob(self) -> str | None:
         log_dir = self.root / "_control" / "ingest_log"
-        return _q(log_dir / "*.parquet") if any(log_dir.glob("*.parquet")) else None
+        return _q(log_dir / "*" / "*.parquet") if any(log_dir.glob("*/*.parquet")) else None
 
-    def loaded_hashes(self, conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    def ingest_log(self, conn: duckdb.DuckDBPyConnection) -> list[dict]:
         glob = self._log_glob()
         if not glob:
-            return {}
-        rows = conn.execute(
-            f"SELECT sha256, file FROM read_parquet('{glob}') WHERE status = 'loaded'"
-        ).fetchall()
-        return dict(rows)
-
-    def seen_files(self, conn: duckdb.DuckDBPyConnection) -> set[str]:
-        glob = self._log_glob()
-        if not glob:
-            return set()
-        return {r[0] for r in conn.execute(f"SELECT file FROM read_parquet('{glob}')").fetchall()}
+            return []
+        cursor = conn.execute(
+            f"SELECT * FROM read_parquet('{glob}', hive_partitioning = false) ORDER BY seq"
+        )
+        names = [d[0] for d in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
     def watermark(self, conn: duckdb.DuckDBPyConnection) -> date | None:
         """Latest arrival date of any file the pipeline has seen."""
         glob = self._log_glob()
         if not glob:
             return None
-        return conn.execute(f"SELECT max(arrival_date) FROM read_parquet('{glob}')").fetchone()[0]
+        return conn.execute(
+            f"SELECT max(arrival_date) FROM read_parquet('{glob}', hive_partitioning = false)"
+        ).fetchone()[0]
 
     def next_batch_id(self) -> str:
         log_dir = self.root / "_control" / "ingest_log"
-        return f"{len(list(log_dir.glob('*.parquet'))) + 1:06d}" if log_dir.exists() else "000001"
+        batches = [p for p in log_dir.glob("batch_id=*") if p.is_dir()] if log_dir.exists() else []
+        return f"{len(batches) + 1:06d}"
 
-    def append_ingest_log(
-        self, conn: duckdb.DuckDBPyConnection, batch_id: str, results: list[IngestResult]
-    ) -> None:
-        if not results:
-            return  # nothing new arrived; a no-op run leaves no trace
-        log_dir = self.root / "_control" / "ingest_log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        conn.execute(
-            """CREATE OR REPLACE TEMP TABLE _log (
-                   batch_id VARCHAR, source VARCHAR, file VARCHAR, sha256 VARCHAR,
-                   arrival_date DATE, file_business_date DATE, status VARCHAR,
-                   encoding VARCHAR, records INTEGER, header_repeats INTEGER,
-                   parse_errors INTEGER, ingested_at TIMESTAMP)"""
+    def write_ingest_log_entry(self, batch_id: str, r: IngestResult) -> None:
+        f = r.file
+        row = {
+            "batch_id": batch_id,
+            "seq": r.seq,
+            "source": f.source,
+            "file": f.relative,
+            "sha256": r.sha256,
+            "arrival_date": f.arrival_date,
+            "file_business_date": f.business_date,
+            "status": r.status,
+            "error": r.error,
+            "encoding": r.encoding,
+            "records": r.records,
+            "header_repeats": r.header_repeats,
+            "parse_errors": r.parse_errors,
+            "ingested_at": datetime.now(timezone.utc).replace(tzinfo=None),
+        }
+        table = pa.Table.from_pylist([row], schema=INGEST_LOG_SCHEMA)
+        target = (
+            self.root / "_control" / "ingest_log" / f"batch_id={batch_id}" / f"{r.seq:08d}.parquet"
         )
-        conn.executemany(
-            "INSERT INTO _log VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp::TIMESTAMP)",
-            [
-                (
-                    batch_id,
-                    r.file.source,
-                    r.file.relative,
-                    r.sha256,
-                    r.file.arrival_date,
-                    r.file.business_date,
-                    r.status,
-                    r.encoding,
-                    r.records,
-                    r.header_repeats,
-                    r.parse_errors,
-                )
-                for r in results
-            ],
-        )
-        conn.execute(
-            f"COPY _log TO '{_q(log_dir / f'batch_id={batch_id}.parquet')}' (FORMAT PARQUET)"
-        )
+        atomic_write_table(table, target)
+
+    def remove_orphan_bronze(self, conn: duckdb.DuckDBPyConnection) -> list[Path]:
+        """Delete bronze files with no ingest-log entry (left by a crash mid-file)."""
+        expected = {
+            self.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
+            for r in self.ingest_log(conn)
+            if r["status"] == "loaded"
+        }
+        orphans = [p for p in (self.root / "bronze").glob("*/*/*.parquet") if p not in expected]
+        for p in orphans:
+            p.unlink()
+        for tmp in self.root.rglob("*.tmp"):
+            tmp.unlink()
+        return orphans
 
     # ------------------------------------------------------------------ catalog
 
@@ -155,14 +192,20 @@ class Lake:
                         else self.layer_glob(layer, table_dir.name)
                     )
                     if glob:
+                        hive = (
+                            "true, hive_types = {'business_month': VARCHAR}"
+                            if layer in ("silver", "quarantine")
+                            else "false"
+                        )
                         conn.execute(
                             f"CREATE VIEW {schema}.{table_dir.name} AS "
-                            f"SELECT * FROM read_parquet('{glob}', hive_partitioning = false)"
+                            f"SELECT * FROM read_parquet('{glob}', hive_partitioning = {hive})"
                         )
             log = self._log_glob()
             if log:
                 conn.execute(
-                    f"CREATE VIEW control.ingest_log AS SELECT * FROM read_parquet('{log}')"
+                    "CREATE VIEW control.ingest_log AS "
+                    f"SELECT * FROM read_parquet('{log}', hive_partitioning = false)"
                 )
         finally:
             conn.close()

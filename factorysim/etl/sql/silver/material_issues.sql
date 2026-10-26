@@ -7,12 +7,12 @@ WITH parsed AS (
         upper(trim(record ->> 'station')) AS station_raw,
         upper(trim(record ->> 'shift')) AS shift,
         upper(trim(record ->> 'material')) AS material_raw,
-        TRY_CAST(record ->> 'qty' AS INTEGER) AS qty,
+        strict_int(record ->> 'qty') AS qty,
         upper(coalesce(record ->> 'uom', 'EA')) AS uom
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN issue_id IS NULL THEN 'missing_key'

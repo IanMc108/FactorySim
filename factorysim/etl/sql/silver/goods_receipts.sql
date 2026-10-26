@@ -6,16 +6,16 @@ WITH parsed AS (
         NULLIF(trim(record ->> 'po_number'), '') AS po_no,
         CAST(try_strptime(record ->> 'receipt_date', '%Y-%m-%d') AS DATE) AS receipt_date,
         upper(trim(record ->> 'material')) AS material_raw,
-        TRY_CAST(record ->> 'quantity' AS INTEGER) AS qty,
+        strict_int(record ->> 'quantity') AS qty,
         upper(trim(record ->> 'uom')) AS uom,
-        TRY_CAST(regexp_replace(record ->> 'unit_cost', '[$,\s]', '', 'g') AS DECIMAL(18, 4))
+        money(record ->> 'unit_cost')
             AS unit_cost,
-        TRY_CAST(regexp_replace(record ->> 'extended_cost', '[$,\s]', '', 'g') AS DECIMAL(18, 2))
+        money(record ->> 'extended_cost')
             AS amount
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN gr_no IS NULL OR po_no IS NULL THEN 'missing_key'

@@ -4,7 +4,7 @@ WITH parsed AS (
     SELECT
         *,
         NULLIF(trim(record ->> 'event_id'), '') AS event_id,
-        TRY_CAST(coalesce(record ->> 'revision', record ->> 'rev') AS INTEGER) AS revision,
+        strict_int(coalesce(record ->> 'revision', record ->> 'rev')) AS revision,
         CASE
             WHEN record ->> 'event_ts_utc' IS NOT NULL
                 THEN try_strptime(record ->> 'event_ts_utc', '%Y-%m-%dT%H:%M:%SZ')
@@ -19,7 +19,7 @@ WITH parsed AS (
         END AS shift,
         coalesce(record ->> 'lot_id', record ->> 'lot') AS lot_id,
         upper(trim(coalesce(record ->> 'item_code', record ->> 'sku'))) AS sku_raw,
-        TRY_CAST(coalesce(record ->> 'quantity', record ->> 'qty') AS INTEGER) AS qty,
+        strict_int(coalesce(record ->> 'quantity', record ->> 'qty')) AS qty,
         upper(coalesce(record ->> 'uom', 'EA')) AS uom,
         coalesce(record ->> 'operator_id', record ->> 'operator') AS operator_id,
         record ->> 'comment' AS comment
@@ -36,7 +36,7 @@ resolved AS (
     LEFT JOIN ref_sku_aliases k ON k.alias = p.sku_raw
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN event_id IS NULL THEN 'missing_key'

@@ -9,18 +9,18 @@ WITH parsed AS (
         CAST(coalesce(try_strptime(record ->> 'document_date', '%m/%d/%Y'),
                       try_strptime(record ->> 'document_date', '%Y-%m-%d')) AS DATE) AS doc_date,
         trim(record ->> 'customer_id') AS customer_id,
-        TRY_CAST(record ->> 'line_no' AS INTEGER) AS line_no,
+        strict_int(record ->> 'line_no') AS line_no,
         upper(trim(record ->> 'sku')) AS sku_raw,
-        TRY_CAST(record ->> 'quantity' AS INTEGER) AS qty,
-        TRY_CAST(regexp_replace(record ->> 'unit_price', '[$,\s]', '', 'g') AS DECIMAL(18, 2))
+        strict_int(record ->> 'quantity') AS qty,
+        money(record ->> 'unit_price')
             AS unit_price,
-        TRY_CAST(regexp_replace(record ->> 'line_amount', '[$,\s]', '', 'g') AS DECIMAL(18, 2))
+        money(record ->> 'line_amount')
             AS line_amount,
         upper(trim(record ->> 'currency')) AS currency
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN doc_no IS NULL OR line_no IS NULL THEN 'missing_key'

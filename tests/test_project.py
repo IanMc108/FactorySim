@@ -87,7 +87,8 @@ def _block(begin: str, end: str) -> str:
 
 def test_readme_etl_numbers_match_etl_results_json():
     results = json.loads((ROOT / "docs" / "etl_results.json").read_text(encoding="utf-8"))
-    assert _block(ETL_BEGIN, ETL_END) == render_etl_block(results), (
+    sweep = json.loads((ROOT / "docs" / "etl_seed_sweep.json").read_text(encoding="utf-8"))
+    assert _block(ETL_BEGIN, ETL_END) == render_etl_block(results, sweep), (
         "README ETL block is stale: run `factorysim report --section etl`"
     )
 

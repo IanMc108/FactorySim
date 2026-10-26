@@ -267,7 +267,10 @@ SAMPLES = {
 SAMPLE_LINES = 8
 
 
-def build_etl_results(build: Path) -> dict:
+SWEEP_DEFECT_SEEDS = range(1, 9)
+
+
+def build_etl_results(build: Path, defect_seed: int = 7) -> dict:
     from .etl.pipeline import run_pipeline
     from .evaluation import evaluate
     from .sources.export import export_sources
@@ -275,7 +278,9 @@ def build_etl_results(build: Path) -> dict:
     conn = create_database(build / "truth" / "factory.db", overwrite=True)
     try:
         run_simulation(conn, SimConfig())
-        exported = export_sources(conn, build / "landing", build / "truth" / "defects.jsonl")
+        exported = export_sources(
+            conn, build / "landing", build / "truth" / "defects.jsonl", seed=defect_seed
+        )
     finally:
         conn.close()
     run = run_pipeline(build / "landing", build / "lake")
@@ -285,6 +290,7 @@ def build_etl_results(build: Path) -> dict:
     return json.loads(
         json.dumps(
             {
+                "defect_seed": defect_seed,
                 "export": asdict(exported),
                 "pipeline": {
                     "files_loaded": run.files_loaded,
@@ -297,6 +303,24 @@ def build_etl_results(build: Path) -> dict:
             default=str,
         )
     )
+
+
+def sweep_summary(results: dict) -> dict:
+    """The handful of numbers that must hold for every defect seed."""
+    ev = results["evaluation"]
+    r, q = ev["reconciliation"], ev["quarantine"]
+    return {
+        "defect_seed": results["defect_seed"],
+        "defects_injected": sum(d["injected"] for d in ev["defects"]),
+        "defects_handled": sum(d["handled"] for d in ev["defects"]),
+        "quarantine_precision": q["precision"],
+        "quarantine_recall": q["recall"],
+        "business_errors": r["expected_business_errors"],
+        "business_errors_flagged": r["business_errors_flagged"],
+        "masked_by_quarantine": r["masked_by_quarantine"],
+        "unexpected_exceptions": len(r["unexpected_exceptions"]),
+        "unexplained_cells": sum(c["unexplained"] for c in ev["gold_vs_truth"].values()),
+    }
 
 
 def write_samples(build: Path, out_dir: Path) -> None:
@@ -313,7 +337,7 @@ def write_samples(build: Path, out_dir: Path) -> None:
         (out_dir / name).write_text("".join(lines), encoding="utf-8", newline="")
 
 
-def render_etl_block(results: dict) -> str:
+def render_etl_block(results: dict, sweep: list[dict]) -> str:
     ev, pipe, exp = results["evaluation"], results["pipeline"], results["export"]
     q, r = ev["quarantine"], ev["reconciliation"]
     records = sum(e["records"] for e in pipe["entities"])
@@ -347,11 +371,12 @@ def render_etl_block(results: dict) -> str:
         )
     lines += [
         "",
-        f"All {r['exceptions']} exceptions are injected business errors, and "
-        f"{r['business_errors_flagged']} of {r['expected_business_errors']} business-error "
-        f"checks were flagged ({r['business_errors_flagged'] - r['flagged_as_exception']} still "
-        "inside the late-arrival window at the end of the year). "
-        f"Unexpected exceptions: {len(r['unexpected_exceptions'])}.",
+        f"{r['business_errors_flagged']} of {r['expected_business_errors']} checks touched by an "
+        f"injected billing error report it ({r['flagged_as_exception']} as exceptions, "
+        f"{r['business_errors_flagged'] - r['flagged_as_exception']} still open inside the "
+        f"late-arrival window at the end of the year); {r['masked_by_quarantine']} are hidden "
+        f'as "explained". Exceptions that are not injected errors: '
+        f"{len(r['unexpected_exceptions'])}.",
         "",
         "**Gold vs. ground truth** (cells compared against the simulator's database):",
         "",
@@ -362,6 +387,24 @@ def render_etl_block(results: dict) -> str:
         lines.append(
             f"| {name.replace('_', ' ')} | {c['cells']:,} | {c['exact']:,} | "
             f"{c['explained_by_injected_defects']} | {c['unexplained']} |"
+        )
+    lines += [
+        "",
+        f"**The same run for {len(sweep)} defect seeds** (each injects a different set of "
+        "defects; the tables above are seed "
+        f"{results['defect_seed']}):",
+        "",
+        "| Seed | Defects handled | Quarantine P / R | Billing errors reported | Masked "
+        "| Unexpected exceptions | Unexplained cells |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for x in sweep:
+        lines.append(
+            f"| {x['defect_seed']} | {x['defects_handled']:,} / {x['defects_injected']:,} | "
+            f"{x['quarantine_precision']:.0%} / {x['quarantine_recall']:.0%} | "
+            f"{x['business_errors_flagged']} / {x['business_errors']} | "
+            f"{x['masked_by_quarantine']} | {x['unexpected_exceptions']} | "
+            f"{x['unexplained_cells']} |"
         )
     lines += ["", ETL_END]
     return "\n".join(lines)
@@ -374,8 +417,15 @@ def write_etl_report(root: Path) -> dict:
         build = Path(tmp)
         results = build_etl_results(build)
         write_samples(build, root / "docs" / "samples")
+    sweep = []
+    for seed in SWEEP_DEFECT_SEEDS:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep.append(sweep_summary(build_etl_results(Path(tmp), seed)))
     (root / "docs" / "etl_results.json").write_text(
         json.dumps(results, indent=2) + "\n", encoding="utf-8"
     )
-    update_block(root / "README.md", ETL_BEGIN, ETL_END, render_etl_block(results))
+    (root / "docs" / "etl_seed_sweep.json").write_text(
+        json.dumps(sweep, indent=2) + "\n", encoding="utf-8"
+    )
+    update_block(root / "README.md", ETL_BEGIN, ETL_END, render_etl_block(results, sweep))
     return results

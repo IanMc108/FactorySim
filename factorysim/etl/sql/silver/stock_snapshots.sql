@@ -4,12 +4,12 @@ WITH parsed AS (
         *,
         CAST(try_strptime(record ->> 'snapshot_date', '%Y-%m-%d') AS DATE) AS snapshot_date,
         upper(trim(record ->> 'material')) AS material_raw,
-        TRY_CAST(record ->> 'on_hand' AS INTEGER) AS on_hand,
+        strict_int(record ->> 'on_hand') AS on_hand,
         upper(trim(record ->> 'uom')) AS uom
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN snapshot_date IS NULL THEN 'invalid_date'
