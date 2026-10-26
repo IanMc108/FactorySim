@@ -29,6 +29,9 @@ from .ingest import BRONZE_COLUMNS, SOURCES, IngestResult, discover, ingest
 from .lake import Lake, _q, atomic_copy
 
 LATE_ARRIVAL_WINDOW_DAYS = 7
+# How far a record's own date may lie from its file's business date (see build_silver).
+RECORD_DAYS_BEFORE_FILE = 60
+RECORD_DAYS_AFTER_FILE = 1
 PAYMENT_TERMS_DAYS = 3
 STATUSES = ("matched", "open_late_window", "exception")
 
@@ -65,10 +68,11 @@ ENTITIES = (
     ),
 )
 # Parsing helpers shared by the silver SQL. Integers must be plain digits ("10.5", "1e3"
-# and "1_000" are rejected, never rounded); money may carry "$", "," and spaces.
+# and "1_000" are rejected, never rounded) and at most 12 of them, so no sum in gold can
+# overflow; money may carry "$", "," and spaces.
 MACROS = r"""
 CREATE OR REPLACE MACRO strict_int(s) AS
-    CASE WHEN regexp_full_match(trim(s), '-?[0-9]+') THEN TRY_CAST(trim(s) AS BIGINT) END;
+    CASE WHEN regexp_full_match(trim(s), '-?[0-9]{1,12}') THEN TRY_CAST(trim(s) AS BIGINT) END;
 -- Timestamps must match their pattern exactly (no single-digit fields or stray spaces).
 CREATE OR REPLACE MACRO strict_ts(s, pattern, fmt) AS
     CASE WHEN regexp_full_match(s, pattern) THEN try_strptime(s, fmt) END;
@@ -219,8 +223,20 @@ def build_silver(conn, lake: Lake) -> list[EntityStats]:
     stats = []
     for entity in ENTITIES:
         _bronze_view(conn, lake, entity.source)
+        # One rule for every entity on top of its own: a record must be dated near its
+        # file. A back-dated line (a correction, a late line) may be up to
+        # RECORD_DAYS_BEFORE_FILE older; nothing may be dated after its file's day (+1 for
+        # time zones). A year-2035 bank line in a 2025 statement is quarantined, so it can
+        # neither sit "open" for years nor stretch any window.
         conn.execute(
-            f"CREATE OR REPLACE TEMP TABLE validated AS {_sql('silver', entity.name + '.sql')}"
+            f"""CREATE OR REPLACE TEMP TABLE validated AS
+                SELECT * REPLACE (coalesce(
+                    reject_reason,
+                    CASE WHEN business_date NOT BETWEEN
+                              _file_business_date - {RECORD_DAYS_BEFORE_FILE}
+                              AND _file_business_date + {RECORD_DAYS_AFTER_FILE}
+                         THEN 'implausible_date' END) AS reject_reason)
+                FROM ({_sql("silver", entity.name + ".sql")})"""
         )
         keys = ", ".join(entity.keys)
         conn.execute(
@@ -339,6 +355,7 @@ def build_gold(conn, lake: Lake, watermark: date) -> tuple[dict, dict]:
             SELECT *,
                    CASE WHEN variance = 0 THEN 'matched'
                         WHEN business_date > DATE '{watermark}' - {LATE_ARRIVAL_WINDOW_DAYS}
+                             AND business_date <= DATE '{watermark}' + 1
                             THEN 'open_late_window'
                         ELSE 'exception'
                    END AS status
@@ -405,7 +422,11 @@ def build_gold(conn, lake: Lake, watermark: date) -> tuple[dict, dict]:
     return summary, {"new_exceptions": changes[0], "cleared_exceptions": changes[1]}
 
 
-def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) -> RunSummary:
+def run_pipeline(
+    landing: Path, lake_root: Path, through: date | None = None, today: date | None = None
+) -> RunSummary:
+    """Run ingest, silver and gold over newly landed files. ``today`` (default: the UTC
+    date) is the clock that arrivals from the future are rejected against."""
     lake = Lake(lake_root)
     lake_root.mkdir(parents=True, exist_ok=True)
     with lake.lock():
@@ -417,7 +438,7 @@ def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) ->
             _load_reference(conn)
             batch_id = lake.next_batch_id()
             landed = discover(landing, through)
-            results: list[IngestResult] = ingest(conn, lake, landed, batch_id)
+            results: list[IngestResult] = ingest(conn, lake, landed, batch_id, today)
             loaded = {r.file.relative for r in results if r.status == "loaded"}
             last_entry = {r["file"]: r for r in lake.ingest_log(conn)}  # ordered by seq
             rejected = [

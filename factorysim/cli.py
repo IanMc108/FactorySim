@@ -108,6 +108,13 @@ def _evaluate(build: Path) -> dict:
     return results
 
 
+# `factorysim etl` exit statuses, for a scheduler. 1 is an unexpected error and 2 a usage
+# error (argparse), so neither is reused.
+EXIT_DATA_PROBLEM = 3  # a landed file stands rejected, or a file version's data is lost
+EXIT_EXCEPTIONS = 4  # with --fail-on-new-exceptions or --fail-on-exceptions
+EXIT_LOCKED = 5  # another run holds the lake's lock
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="factorysim", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -146,13 +153,14 @@ def main(argv: list[str] | None = None) -> None:
     etl.add_argument(
         "--fail-on-new-exceptions",
         action="store_true",
-        help="exit 2 if this run raised exceptions the previous run did not have "
+        help=f"exit {EXIT_EXCEPTIONS} if this run raised exceptions the previous run did not have "
         "(edge-triggered: a retry of the same run exits 0)",
     )
     etl.add_argument(
         "--fail-on-exceptions",
         action="store_true",
-        help="exit 2 while any reconciliation exception is outstanding (level-triggered)",
+        help=f"exit {EXIT_EXCEPTIONS} while any reconciliation exception is outstanding "
+        "(level-triggered)",
     )
     etl.add_argument(
         "--through",
@@ -202,15 +210,21 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "export":
         _export(args.build, args.seed, args.defect_seed)
     elif args.command == "etl":
-        summary = _etl(args.landing, args.lake, args.through)
+        from .etl.lake import LakeLocked
+
+        try:
+            summary = _etl(args.landing, args.lake, args.through)
+        except LakeLocked as exc:
+            print(f"LOCKED: {exc}")
+            raise SystemExit(EXIT_LOCKED) from None
         # Data problems first: they stay until the files are fixed, so a retry fails again.
         if summary.rejected_files or summary.lost_files:
-            raise SystemExit(3)
+            raise SystemExit(EXIT_DATA_PROBLEM)
         exceptions = sum(r["exceptions"] for r in summary.recon.values())
         if (args.fail_on_new_exceptions and summary.changes["new_exceptions"]) or (
             args.fail_on_exceptions and exceptions
         ):
-            raise SystemExit(2)
+            raise SystemExit(EXIT_EXCEPTIONS)
     elif args.command == "evaluate":
         results = _evaluate(args.build)
         if args.json:

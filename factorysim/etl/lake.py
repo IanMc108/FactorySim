@@ -14,7 +14,9 @@ prefixes with the Glue Data Catalog in place of catalog.duckdb.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -24,6 +26,8 @@ from typing import TYPE_CHECKING
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .ingest import IngestResult
@@ -45,12 +49,29 @@ INGEST_LOG_SCHEMA = pa.schema(
         ("records", pa.int64()),
         ("header_repeats", pa.int64()),
         ("parse_errors", pa.int64()),
+        # Fingerprint of the parsed records, so the same data in different bytes (CRLF line
+        # endings, a BOM, another encoding) is recognised as the same version's content.
+        ("content_sha256", pa.string()),
         ("size", pa.int64()),
         ("mtime_ns", pa.int64()),
         ("ctime_ns", pa.int64()),
         ("ingested_at", pa.timestamp("us")),
     ]
 )
+
+
+class LakeLocked(RuntimeError):
+    """Another run holds the lake's lock."""
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
 
 
 def _q(path: Path | str) -> str:
@@ -86,13 +107,18 @@ class Lake:
 
     # ------------------------------------------------------------------ paths
 
-    def bronze_file(self, source: str, arrival: date, stem: str, sha: str) -> Path:
+    def bronze_file(
+        self, source: str, arrival: date, stem: str, sha: str, duplicate: bool = False
+    ) -> Path:
+        # A duplicate arrival gets an empty marker file: it holds no records (the loaded
+        # version has them) but carries the arrival's ingest metadata, so the log entry can
+        # be rebuilt from bronze like any other.
         return (
             self.root
             / "bronze"
             / source
             / f"arrival_date={arrival}"
-            / f"{stem}__{sha[:12]}.parquet"
+            / f"{stem}__{sha[:12]}{'.dup' if duplicate else ''}.parquet"
         )
 
     def bronze_glob(self, source: str) -> str | None:
@@ -161,6 +187,7 @@ class Lake:
             "records": r.records,
             "header_repeats": r.header_repeats,
             "parse_errors": r.parse_errors,
+            "content_sha256": r.content_sha256,
             "size": f.size,
             "mtime_ns": f.mtime_ns,
             "ctime_ns": f.ctime_ns,
@@ -172,20 +199,48 @@ class Lake:
         )
         atomic_write_table(table, target)
 
+    def entry_bronze(self, r: dict) -> Path:
+        """The bronze file a loaded or duplicate log entry wrote."""
+        return self.bronze_file(
+            r["source"],
+            r["arrival_date"],
+            Path(r["file"]).stem,
+            r["sha256"],
+            duplicate=r["status"] == "duplicate_content",
+        )
+
+    def bronze_files(self) -> set[Path]:
+        return set((self.root / "bronze").glob("*/*/*.parquet"))
+
+    @staticmethod
+    def content_key(source: str, file: str, sha: str) -> tuple[str, str, str]:
+        """Identifies a file version's records in bronze, whichever arrival wrote them."""
+        return source, Path(file).stem, sha[:12]
+
+    def bronze_contents(self, present: set[Path]) -> set[tuple[str, str, str]]:
+        """Content keys of the file versions whose records are in bronze (not markers)."""
+        return {
+            (p.parts[-3], *p.name.removesuffix(".parquet").rsplit("__", 1))
+            for p in present
+            if not p.name.endswith(".dup.parquet")
+        }
+
     def lost_versions(self, conn: duckdb.DuckDBPyConnection) -> list[str]:
-        """Current file versions whose bronze file is missing (after ingest has rebuilt what
-        it could from the landing zone): their records are no longer in silver."""
-        present = set((self.root / "bronze").glob("*/*/*.parquet"))
-        current = {
-            (s, n, h) for s, n, h in conn.execute("SELECT * FROM current_versions").fetchall()
+        """Current file versions whose records are in no bronze file (after ingest has
+        rebuilt what it could from the landing zone): they are no longer in silver."""
+        contents = self.bronze_contents(self.bronze_files())
+        lost = {
+            (s, n, h)
+            for s, n, h in conn.execute("SELECT * FROM current_versions").fetchall()
+            if self.content_key(s, n, h) not in contents
         }
         return sorted(
-            r["file"]
-            for r in self.ingest_log(conn)
-            if r["status"] == "loaded"
-            and (r["source"], Path(r["file"]).name, r["sha256"]) in current
-            and self.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
-            not in present
+            {
+                r["file"]
+                for r in self.ingest_log(conn)
+                if r["status"] == "loaded"
+                and (r["source"], Path(r["file"]).name, r["sha256"]) in lost
+            }
         )
 
     def repair_ingest_log(self) -> None:
@@ -228,7 +283,7 @@ class Lake:
             if glob
             else "(SELECT NULL::VARCHAR AS source, NULL::VARCHAR AS file, NULL::VARCHAR AS sha256, "
             "NULL::DATE AS arrival_date, NULL::TIMESTAMP AS arrival_ts, NULL::BIGINT AS seq, "
-            "NULL::VARCHAR AS status) WHERE false"
+            "NULL::VARCHAR AS status WHERE false)"
         )
         conn.execute(
             f"""CREATE OR REPLACE TEMP TABLE current_versions AS
@@ -261,28 +316,30 @@ class Lake:
                     WHERE status IN ('loaded', 'duplicate_content')
                 ),
                 content AS (
-                    SELECT source, file_name, sha256, max(records) AS records
-                    FROM log WHERE status = 'loaded' GROUP BY ALL
+                    SELECT source, file_name, sha256, max(records) AS records,
+                           any_value(coalesce(content_sha256, sha256)) AS content
+                    FROM log WHERE status = 'loaded' GROUP BY source, file_name, sha256
                 ),
                 ranked AS (
-                    SELECT l.source, l.file_name, l.file_business_date, l.sha256, c.records,
+                    SELECT l.source, l.file_name, l.file_business_date, c.content, c.records,
                            row_number() OVER (
                                PARTITION BY l.source, l.file_name ORDER BY {VERSION_ORDER}
                            ) AS rn,
                            count(*) OVER (PARTITION BY l.source, l.file_name) AS versions
                     FROM log l JOIN content c USING (source, file_name, sha256)
                 ),
-                current AS (SELECT source, file_name, sha256 FROM ranked WHERE rn = 1)
+                current AS (SELECT source, file_name, content FROM ranked WHERE rn = 1)
                 SELECT r.source, r.file_name,
                        any_value(r.file_business_date) AS file_business_date,
                        max(r.versions) AS versions,
                        max(r.records) FILTER (WHERE r.rn = 1) AS current_records,
                        coalesce(max(r.records) FILTER (WHERE r.rn > 1), 0) AS max_earlier_records,
-                       -- A revert: the current content had been replaced by different content
-                       -- before it came back (A, B, then A again, e.g. a stale re-send). rn
-                       -- grows with age, so some copy of A is older than the newest non-A.
-                       coalesce(min(r.rn) FILTER (WHERE r.sha256 <> cur.sha256)
-                                < max(r.rn) FILTER (WHERE r.rn > 1 AND r.sha256 = cur.sha256),
+                       -- A revert: the current records had been replaced by different records
+                       -- before they came back (A, B, then A again, e.g. a stale re-send, in
+                       -- the same or different bytes). rn grows with age, so some copy of A
+                       -- is older than the newest non-A.
+                       coalesce(min(r.rn) FILTER (WHERE r.content <> cur.content)
+                                < max(r.rn) FILTER (WHERE r.rn > 1 AND r.content = cur.content),
                                 false) AS reverted
                 FROM ranked r JOIN current cur USING (source, file_name)
                 GROUP BY r.source, r.file_name"""
@@ -298,11 +355,11 @@ class Lake:
         """
         self.repair_ingest_log()
         expected = {
-            self.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
+            self.entry_bronze(r)
             for r in self.ingest_log(conn)
-            if r["status"] == "loaded"
+            if r["status"] in ("loaded", "duplicate_content")
         }
-        present = set((self.root / "bronze").glob("*/*/*.parquet"))
+        present = self.bronze_files()
         for orphan in sorted(present - expected):
             meta = (pq.read_schema(orphan).metadata or {}).get(b"factorysim.ingest")
             if meta is None:
@@ -321,12 +378,13 @@ class Lake:
                 "arrival_date": date.fromisoformat(m["arrival_date"]),
                 "arrival_ts": datetime.fromisoformat(m["arrival_ts"]),
                 "file_business_date": date.fromisoformat(m["file_business_date"]),
-                "status": "loaded",
+                "status": m.get("status", "loaded"),
                 "error": "recovered from bronze metadata",
                 "encoding": m["encoding"],
                 "records": m["records"],
                 "header_repeats": m["header_repeats"],
                 "parse_errors": m["parse_errors"],
+                "content_sha256": m.get("content_sha256"),
                 "size": m["size"],
                 "mtime_ns": m["mtime_ns"],
                 "ctime_ns": m["ctime_ns"],
@@ -347,18 +405,32 @@ class Lake:
 
     @contextmanager
     def lock(self) -> Iterator[None]:
-        """Refuse to run two pipelines against the same lake at once."""
+        """Refuse to run two pipelines against the same lake at once.
+
+        The lock file holds the owner's host and PID. A lock left by a process that no
+        longer exists on this host (killed by the OOM killer, a spot interruption) is
+        taken over; any other lock is respected.
+        """
         path = self.root / "_control" / "run.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
+        host = socket.gethostname()
+        for _ in range(2):
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                owner_host, _, pid = path.read_text().strip().partition(" ")
+                if owner_host != host or not pid.isdigit() or _process_alive(int(pid)):
+                    raise LakeLocked(
+                        f"{path} is held by {owner_host or '?'} pid {pid or '?'}: another run "
+                        "is in progress (delete the file only if that process is gone)"
+                    ) from None
+                log.warning("taking over %s from dead process %s", path, pid)
+                path.unlink(missing_ok=True)
+        else:
+            raise LakeLocked(f"{path}: could not take the lock")
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            raise RuntimeError(
-                f"{path} exists: another run is in progress, or one crashed "
-                "(delete the file once you are sure no run is active)"
-            ) from None
-        try:
-            os.write(fd, f"{os.getpid()}\n".encode())
+            os.write(fd, f"{host} {os.getpid()}\n".encode())
             os.close(fd)
             yield
         finally:

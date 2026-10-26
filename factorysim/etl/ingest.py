@@ -118,6 +118,7 @@ class IngestResult:
     header_repeats: int
     parse_errors: int
     error: str | None = None
+    content_sha256: str | None = None  # fingerprint of the parsed records
 
 
 def _ymd(text: str) -> date | None:
@@ -279,33 +280,56 @@ def _with_file_metadata(table: pa.Table, result: IngestResult, batch_id: str) ->
         "records": result.records,
         "header_repeats": result.header_repeats,
         "parse_errors": result.parse_errors,
+        "status": result.status,
+        "content_sha256": result.content_sha256,
     }
     return table.replace_schema_metadata({"factorysim.ingest": json.dumps(meta)})
 
 
+def _content_sha256(rows: list[tuple]) -> str:
+    """Fingerprint of a file's parsed records, independent of line endings, BOM, encoding
+    and record numbering, so a re-send of the same data in other bytes is recognised."""
+    h = hashlib.sha256()
+    for _, error, raw, record in rows:
+        h.update(f"{error}\x1f{raw if error else ''}\x1f{record}\x1e".encode())
+    return h.hexdigest()
+
+
 def ingest(
-    conn: duckdb.DuckDBPyConnection, lake: Lake, files: list[LandedFile], batch_id: str
+    conn: duckdb.DuckDBPyConnection,
+    lake: Lake,
+    files: list[LandedFile],
+    batch_id: str,
+    today: date | None = None,
 ) -> list[IngestResult]:
     """Load new file versions into bronze, committing each file and its log entry in turn."""
     existing_bronze = lake.recover_orphan_bronze(conn)
     log = lake.ingest_log(conn)
-
-    def bronze_path(r: dict) -> Path:
-        return lake.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
-
-    # A loaded version whose bronze file has gone missing is treated as never loaded, so
-    # the landing file is read and ingested again.
-    lost = {
-        r["sha256"]
-        for r in log
-        if r["status"] == "loaded" and bronze_path(r) not in existing_bronze
-    }
+    today = today or datetime.now(timezone.utc).date()
+    # A file version's records count as loaded only while some bronze file holds them. If
+    # none does, they are lost, and any landed copy of them is read and loaded again.
+    contents = lake.bronze_contents(existing_bronze)
     loaded = {
-        (r["source"], Path(r["file"]).name, r["sha256"])
+        (r["source"], Path(r["file"]).name, r["sha256"]): r.get("content_sha256")
         for r in log
-        if r["status"] == "loaded" and r["sha256"] not in lost
+        if r["status"] == "loaded"
+        and lake.content_key(r["source"], r["file"], r["sha256"]) in contents
     }
-    last_by_path = {r["file"]: r for r in log}  # log is ordered by seq
+    last_by_path: dict[str, dict] = {}
+    for r in log:  # ordered by seq; a touch keeps the verdict of the entry it touched
+        previous = last_by_path.get(r["file"])
+        if r["status"] == "touched" and previous:
+            r = {**r, "status": previous["status"]}
+        last_by_path[r["file"]] = r
+
+    def must_reread(last: dict) -> bool:
+        """An unchanged path is read again if what its last entry recorded is gone."""
+        if last["status"] == "rejected":
+            return False
+        if (last["source"], Path(last["file"]).name, last["sha256"]) not in loaded:
+            return True  # its records are in no bronze file
+        return lake.entry_bronze(last) not in existing_bronze  # e.g. a duplicate's marker
+
     next_seq = max((r["seq"] for r in log), default=0) + 1
     results = []
     for f in files:
@@ -313,17 +337,20 @@ def ingest(
         stamp = (f.size, f.mtime_ns, f.ctime_ns)
         if (
             last
-            and last["sha256"] not in lost
             and (last.get("size"), last.get("mtime_ns"), last.get("ctime_ns")) == stamp
+            and not must_reread(last)
         ):
             continue  # unchanged since it was last seen (size, mtime and ctime): not read
         payload = f.path.read_bytes()
         sha = hashlib.sha256(payload).hexdigest()
         seq, next_seq = next_seq, next_seq + 1
+        key = (f.source, f.name, sha)
         # The path and date rules come first, so a copy of good content in a bad place is
         # rejected like anything else there (it must not count as a duplicate or a touch).
         if f.arrival_date is None or f.business_date is None:
             problem = "unrecognized landing path or file name"
+        elif f.arrival_date > today + timedelta(days=1):
+            problem = f"arrival date {f.arrival_date} is in the future"
         elif not (
             f.business_date
             <= f.arrival_date
@@ -336,11 +363,21 @@ def ingest(
             problem = None
         if problem:
             result = IngestResult(f, sha, seq, "rejected", "", 0, 0, 0, problem)
-        elif last and last["sha256"] == sha and sha not in lost:
-            # Same content, new stamp: record it so the next run skips the read.
+        elif (
+            last
+            and last["status"] != "rejected"
+            and last["sha256"] == sha
+            and not must_reread(last)
+        ):
+            # Same content as last time, new stamp: record it so the next run skips the
+            # read. A path whose last verdict was a rejection is never "touched": it is
+            # judged again below, and rejected again if nothing changed.
             result = IngestResult(f, sha, seq, "touched", "", 0, 0, 0)
-        elif (f.source, f.name, sha) in loaded:
-            result = IngestResult(f, sha, seq, "duplicate_content", "", 0, 0, 0)
+        elif key in loaded:
+            result = IngestResult(f, sha, seq, "duplicate_content", "", 0, 0, 0, None, loaded[key])
+            marker = lake.bronze_file(f.source, f.arrival_date, Path(f.relative).stem, sha, True)
+            empty = _bronze_table(f, sha, seq, batch_id, [])
+            atomic_write_table(_with_file_metadata(empty, result, batch_id), marker)
         else:
             try:
                 text, encoding = _decode(payload)
@@ -351,19 +388,30 @@ def ingest(
                     f, sha, seq, "rejected", "", 0, 0, 0, f"{type(exc).__name__}: {exc}"[:300]
                 )
             else:
-                result = IngestResult(f, sha, seq, "loaded", encoding, len(rows), repeats, errors)
+                content = _content_sha256(rows)
+                result = IngestResult(
+                    f, sha, seq, "loaded", encoding, len(rows), repeats, errors, None, content
+                )
                 target = lake.bronze_file(f.source, f.arrival_date, Path(f.relative).stem, sha)
                 table = _bronze_table(f, sha, seq, batch_id, rows)
                 atomic_write_table(_with_file_metadata(table, result, batch_id), target)
-                loaded.add((f.source, f.name, sha))
-                lost.discard(sha)
+                loaded[key] = content
         lake.write_ingest_log_entry(batch_id, result)
         last_by_path[f.relative] = {
+            "source": f.source,
+            "file": f.relative,
             "sha256": sha,
+            "arrival_date": f.arrival_date,
+            "status": result.status if result.status != "touched" else last["status"],
             "size": f.size,
             "mtime_ns": f.mtime_ns,
             "ctime_ns": f.ctime_ns,
         }
+        existing_bronze = existing_bronze | (
+            {lake.entry_bronze(last_by_path[f.relative])}
+            if result.status in ("loaded", "duplicate_content")
+            else set()
+        )
         results.append(result)
     lake.compact_ingest_log(batch_id)
     return results

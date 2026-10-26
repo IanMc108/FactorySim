@@ -31,7 +31,7 @@ SELECT
     coalesce(sum(qty) FILTER (WHERE doc_type = 'INV'), 0)::BIGINT AS invoiced_units,
     coalesce(-sum(qty) FILTER (WHERE doc_type = 'CM'), 0)::BIGINT AS credited_units,
     sum(qty)::BIGINT AS net_units,
-    sum(line_amount)::DECIMAL(18, 2) AS net_revenue
+    sum(line_amount)::DECIMAL(38, 2) AS net_revenue
 FROM lines
 GROUP BY ALL
 ORDER BY ALL;
@@ -43,19 +43,32 @@ FROM silver_goods_receipts
 ORDER BY receipt_date, gr_no;
 
 -- table: fct_maintenance
--- One row per work order. If a completion is re-sent with a correction, the latest
--- completion event (by event time) supplies the date and cost.
+-- One row per work order. If a completion is re-sent with a correction, the newest
+-- extract wins, as everywhere else (then the latest arrival, then the latest event time):
+-- a correction may also move the completion time earlier.
+WITH completions AS (
+    SELECT *, {'extract': _file_business_date, 'arrival': _arrival_date,
+               'event': event_ts_utc, 'line': _record_number} AS newest
+    FROM silver_work_order_events WHERE event = 'COMPLETED'
+)
 SELECT
-    work_order,
-    any_value(asset) AS asset,
-    min(event_ts_utc) FILTER (WHERE event = 'OPENED') AS opened_at_utc,
-    max(event_ts_utc) FILTER (WHERE event = 'COMPLETED') AS completed_at_utc,
-    arg_max(business_date, event_ts_utc) FILTER (WHERE event = 'COMPLETED') AS business_date,
-    arg_max(cost, event_ts_utc) FILTER (WHERE event = 'COMPLETED')::DECIMAL(18, 2) AS cost,
-    count(*) FILTER (WHERE event = 'COMPLETED') AS completion_events
-FROM silver_work_order_events
-GROUP BY work_order
-ORDER BY work_order;
+    o.work_order,
+    coalesce(any_value(c.asset), any_value(o.asset)) AS asset,
+    min(o.event_ts_utc) FILTER (WHERE o.event = 'OPENED') AS opened_at_utc,
+    any_value(c.completed_at_utc) AS completed_at_utc,
+    any_value(c.business_date) AS business_date,
+    any_value(c.cost)::DECIMAL(18, 2) AS cost,
+    coalesce(any_value(c.completion_events), 0) AS completion_events
+FROM silver_work_order_events o
+LEFT JOIN (
+    SELECT work_order, arg_max(asset, newest) AS asset,
+           arg_max(event_ts_utc, newest) AS completed_at_utc,
+           arg_max(business_date, newest) AS business_date, arg_max(cost, newest) AS cost,
+           count(*) AS completion_events
+    FROM completions GROUP BY work_order
+) c ON c.work_order = o.work_order
+GROUP BY o.work_order
+ORDER BY o.work_order;
 
 -- table: fct_bank_transactions
 SELECT
