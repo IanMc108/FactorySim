@@ -171,6 +171,21 @@ def test_glue_versions_follow_the_ingest_log_like_duckdb(spark, job, tmp_path):
     assert qty.fetchall() == [(4,)]
 
 
+def test_glue_upper_trim_agrees_with_duckdb_on_aliases(spark, job):
+    """Java upper-cases ß to SS and the ﬆ ligature to ST; DuckDB leaves them. No current alias
+    contains such letters, so this checks the function directly: either both engines give
+    the same code, or neither gives a plain-ASCII one (so neither can match an alias)."""
+    from pyspark.sql import functions as F
+
+    samples = ["teﬆ-a", "LITHO-Aß", "ﬁlm-a", "lıtho-a", "ſub-pe", "\u00a0litho-a\u2003", "Straße"]
+    frame = spark.createDataFrame([(s,) for s in samples], ["v"])
+    got = dict(frame.select("v", job._upper_trim(F.col("v")).alias("u")).collect())
+    con = duckdb.connect()
+    for s in samples:
+        expected = con.execute("SELECT upper(trim(?))", [s]).fetchone()[0]
+        assert got[s] == expected or not (got[s].isascii() or expected.isascii()), s
+
+
 def test_glue_transform_accepts_an_empty_bronze_frame(spark, job, tmp_path):
     import pyarrow.parquet as pq
 

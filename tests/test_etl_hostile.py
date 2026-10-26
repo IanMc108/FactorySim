@@ -1702,3 +1702,31 @@ def test_only_a_line_starting_lockbox_deposit_is_a_receipt(tmp_path):
     land(tmp_path, *LATE_SNAPSHOT)
     run(tmp_path)
     assert [s for *_, s in recon(tmp_path, "unreferenced_bank_lines")] == ["exception"]
+
+
+def test_work_order_payment_before_completion_is_outside_terms(tmp_path):
+    land(
+        tmp_path,
+        "cmms_work_orders",
+        "2025-03-04",
+        "cmms_work_orders_20250304.jsonl",
+        '{"work_order":"WO-25-0001","event":"COMPLETED","timestamp":"2025-03-04T12:00:00-06:00",'
+        '"asset":"LITHO-BAY","cost":{"amount":"5000.00","currency":"USD"}}\n',
+    )
+    land(
+        tmp_path,
+        "bank_statements",
+        "2025-03-03",
+        "bank_statement_20250303.csv",
+        bank_lines(
+            '03/03/2025,BALANCE FORWARD,,,"100,000.00"',
+            '03/03/2025,ACH DEBIT ASML SERVICE WO-25-0001,"5,000.00",,"95,000.00"',
+        ),
+        "cp1252",
+    )
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    assert recon(tmp_path, "maintenance_payments") == [
+        ("WO-25-0001", 5000, 0, "exception"),
+        ("WO-25-0001 (payment outside terms or without work order)", 0, 5000, "exception"),
+    ]
