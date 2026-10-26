@@ -167,7 +167,7 @@ The data here is about 25k records a year. Three things would change at producti
 - **Bronze is one small Parquet file per landed file** (about 1,650 a year, a few KB each), which is the classic small-files problem on S3. A compaction job could merge each arrival partition, but not as things stand: recovery (run model, step 1) finds a bronze file by its path and reads its ingest metadata from that file's footer, so a merged file would look like an orphan and its originals like lost bronze. Compaction needs a table format (Iceberg keeps a manifest of data files) or a recovery step that reads the per-record lineage columns instead.
 - **Bronze stores each record as JSON text.** That keeps bronze schema-agnostic across the MES schema change and malformed rows (raw text is now kept only for records that failed to parse). The price is that queries on bronze parse JSON. At scale, a typed bronze per feed and schema version (or a VARIANT/struct column) would be cheaper to query.
 
-## What I would add next
+## If this is picked up again
 
 - Data contracts per feed (column names, types, allowed values) checked at bronze, with an alert on schema drift instead of silent `coalesce` across versions.
 - Volume and freshness monitors per feed (expected files per day, records per file).

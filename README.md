@@ -4,7 +4,9 @@
 
 A year-long simulation of a small semiconductor plant, and a **dirty-data ETL and reconciliation pipeline** that has to rebuild the plant's books from the messy files its systems export.
 
-The simulator knows the true production, sales, purchases, maintenance and cash. An exporter renders that truth as the daily files five source systems would drop into a landing zone, then damages them with 13 kinds of labelled defect. The pipeline (Python and DuckDB SQL over Parquet) loads, cleans, deduplicates, quarantines and reconciles those files without ever seeing the truth. An evaluator then scores the result against the truth, record by record.
+> **Status:** finished and shelved (October 2026). The code, tests and generated results are complete and consistent; see [How this was built](#how-this-was-built) for who and what wrote it.
+
+The simulator knows the true production, sales, purchases, maintenance and cash. An exporter renders that truth as the daily files of seven feeds from four source systems (MES, ERP, maintenance system and bank), dropped into a landing zone, then damages them with 16 kinds of labelled defect. The pipeline (Python and DuckDB SQL over Parquet) loads, cleans, deduplicates, quarantines and reconciles those files without ever seeing the truth. An evaluator then scores the result against the truth, record by record.
 
 The simulator also answers an operations question on its own: [how often to service the lithography lines](#maintenance-analysis).
 
@@ -61,6 +63,9 @@ A few lines of each are in [`docs/samples/`](docs/samples/), re-encoded as UTF-8
 | `unknown_code` | ERP | A SKU typo that is not in the alias table | Quarantines it as `unknown_sku` and never guesses |
 | `missing_key` | ERP | A blank document number | Quarantines it |
 | `double_keyed_line` | ERP | A line entered twice under a new line number: a genuine billing error that no row-level rule can see | Reconciliation flags it (production vs. sales, and invoices vs. bank deposits) |
+| `double_payment` | bank | A supplier paid twice for one purchase order | Supplier-payment reconciliation flags it |
+| `late_payment` | bank | A supplier paid 5–10 days after receipt, outside the payment terms | Supplier-payment reconciliation flags the unpaid PO and the out-of-terms payment |
+| `missing_file` | MES | A day's production file that never arrives | Mass balance and production vs. sales flag the day |
 
 ### Results
 
@@ -193,10 +198,11 @@ The lake is plain Parquet in S3-style prefixes, so each piece maps directly onto
 | gold and reconciliation SQL | Athena views or a Glue Spark job, after porting from DuckDB's SQL dialect (macros, `LATERAL`, list functions) |
 | `factorysim etl` | Step Functions or a Glue workflow, triggered on arrival |
 
-[`aws/glue/silver_production_events.py`](aws/glue/silver_production_events.py) is the MES silver step ported to a Glue 5.0 (Spark 3.5) job. `tests/test_glue_parity.py` runs it on local Spark and asserts that it produces exactly the rows the DuckDB pipeline does, on three kinds of input:
+[`aws/glue/silver_production_events.py`](aws/glue/silver_production_events.py) is the MES silver step ported to a Glue 5.0 (Spark 3.5) job. `tests/test_glue_parity.py` runs it on local Spark and asserts that it produces exactly the rows, and the same quarantine reasons, as the DuckDB pipeline, on:
 - a generated half-year;
 - hand-made hostile records;
-- three seeded batches of fuzzed records.
+- a file overwritten in place by an older copy;
+- three seeded batches of fuzzed records (Unicode spaces, ligatures, overflow-sized numbers, dates far from their file).
 
 [`aws/athena/silver_production_events.sql`](aws/athena/silver_production_events.sql) declares the table with partition projection, so synced months appear without crawlers or `MSCK REPAIR`. Nothing here has been deployed to AWS.
 
@@ -308,9 +314,18 @@ factorysim/
   evaluation.py                     scores the lake against the truth
   report.py, cli.py                 generated docs and the command line
 aws/glue/                           Glue (PySpark) port of the MES silver step
+aws/athena/                         Athena DDL for the same table (partition projection)
 tests/                              pytest suite (incl. hostile inputs and Glue parity)
-docs/                               generated results, charts, samples, design notes
+docs/                               generated results, charts, samples
+  etl-design.md                     how the pipeline works, and its limits
+  review-log.md                     five rounds of adversarial review, finding by finding
 ```
+
+## How this was built
+
+This project was built with AI coding assistants, directed and reviewed by its author. Over its life three were involved: Claude (through Claude Code), OpenAI Codex, and a locally run model whose name was not recorded. The current version (the rebuilt simulator, the ETL pipeline, the Glue port and the five review rounds, all from October 2026) was written with Claude Code. The author chose the problem and the direction (Python, DuckDB and Parquet, an AWS mapping without deployed infrastructure, a PR per phase), and reviewed and merged each phase.
+
+The "reviewer" in [docs/review-log.md](docs/review-log.md) was also an AI agent, prompted to play a skeptical senior data engineer on an AWS Glue team looking for reasons not to hire. It worked from a clean checkout and had to back every finding with a script that reproduced it. Each fix was then checked by re-running those scripts and by mutation testing, as the log records. The commits carry co-author trailers, and the history shows phases landing quickly, which is what this way of working looks like.
 
 ## License
 
