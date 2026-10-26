@@ -48,26 +48,31 @@ class _Lake:
         return f"read_parquet('{self.root / 'quarantine' / '*' / '*' / '*.parquet'}')"
 
 
-def _compare(truth: dict, gold: dict, adjust: dict) -> dict:
-    """Compare cell values; differences fully accounted for by ``adjust`` are explained."""
-    cells = set(truth) | set(gold)
-    exact = explained = 0
+def _compare(truth: dict, gold: dict, adjust: dict) -> tuple[dict, dict]:
+    """Compare cell values; differences fully accounted for by ``adjust`` are explained.
+
+    Returns a JSON-able summary and the verdict for every cell (exact/explained/wrong).
+    """
+    verdicts = {}
     unexplained = []
-    for cell in sorted(cells, key=str):
+    for cell in sorted(set(truth) | set(gold), key=str):
         t, g = truth.get(cell, 0), gold.get(cell, 0)
         if abs(t - g) < 0.005:
-            exact += 1
+            verdicts[cell] = "exact"
         elif abs(t + adjust.get(cell, 0) - g) < 0.005:
-            explained += 1
+            verdicts[cell] = "explained"
         else:
+            verdicts[cell] = "wrong"
             unexplained.append({"cell": [str(c) for c in cell], "truth": t, "gold": g})
-    return {
-        "cells": len(cells),
-        "exact": exact,
-        "explained_by_injected_defects": explained,
-        "unexplained": len(unexplained),
+    counts = Counter(verdicts.values())
+    summary = {
+        "cells": len(verdicts),
+        "exact": counts["exact"],
+        "explained_by_injected_defects": counts["explained"],
+        "unexplained": counts["wrong"],
         "unexplained_examples": unexplained[:5],
     }
+    return summary, verdicts
 
 
 def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
@@ -100,7 +105,7 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
     production_adjust: Counter = Counter()
     for e in by_defect["malformed_row"]:
         if e["source"] == "mes_production":
-            cell = (day(e["business_date"]), e["record_true_station"], e["record_true_sku"])
+            cell = (day(e["record_business_date"]), e["record_true_station"], e["record_true_sku"])
             production_adjust[cell] -= e["record_qty"]
 
     truth_sales_units, truth_sales_revenue = {}, {}
@@ -130,23 +135,40 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
             unit_adjust[cell] += sign * e["record_qty"]
             revenue_adjust[cell] += sign * e["record_qty"] * e["record_price"]
 
+    truth_issues = {
+        (business_date(d), STATION_CODES[s]): u
+        for d, s, u in truth.execute(
+            "SELECT sim_day, station_id, units_consumed FROM production_runs"
+        )
+    }
+    gold_issues = {
+        (d, s): u
+        for d, s, u in lake.rows(
+            "SELECT business_date, station_code, sum(units)::BIGINT "
+            f"FROM {lake.gold('fct_material_issues_daily')} GROUP BY ALL"
+        )
+    }
+
     truth_receipts = {
-        (f"GR-{po:06d}",): qty
-        for po, qty in truth.execute(
-            "SELECT po_id, quantity FROM purchase_orders WHERE received_day IS NOT NULL"
+        (business_date(d), f"GR-{po:06d}"): qty
+        for po, qty, d in truth.execute(
+            """SELECT po_id, quantity, received_day FROM purchase_orders
+               WHERE received_day IS NOT NULL"""
         )
     }
     gold_receipts = {
-        (g,): q
-        for g, q in lake.rows(f"SELECT gr_no, qty_base FROM {lake.gold('fct_goods_receipts')}")
+        (d, g): q
+        for d, g, q in lake.rows(
+            f"SELECT receipt_date, gr_no, qty_base FROM {lake.gold('fct_goods_receipts')}"
+        )
     }
 
     truth_maintenance = {
-        (f"WO-25-{e:04d}", business_date(d)): c
+        (business_date(d), f"WO-25-{e:04d}"): c
         for e, d, c in truth.execute("SELECT event_id, sim_day, cost FROM maintenance_events")
     }
     gold_maintenance = {
-        (w, d): float(c)
+        (d, w): float(c)
         for w, d, c in lake.rows(
             f"SELECT work_order, business_date, cost FROM {lake.gold('fct_maintenance')}"
         )
@@ -159,7 +181,7 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         truth_balance[(business_date(max(d, 1)),)] = balance
     gold_balance = {}
     for d, balance in lake.rows(
-        f"SELECT txn_date, balance FROM {lake.gold('fct_bank_transactions')} ORDER BY txn_date"
+        f"SELECT txn_date, balance FROM {lake.gold('fct_bank_transactions')} ORDER BY line_seq"
     ):
         gold_balance[(d,)] = float(balance)
 
@@ -187,8 +209,9 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
             for m, code in MATERIAL_CODES.items():
                 truth_stock[(bd, code)] = running[m]
 
-    gold_vs_truth = {
+    comparisons = {
         "production_units": _compare(truth_production, gold_production, production_adjust),
+        "material_issue_units": _compare(truth_issues, gold_issues, {}),
         "sales_units": _compare(truth_sales_units, gold_units, unit_adjust),
         "sales_revenue": _compare(truth_sales_revenue, gold_revenue, revenue_adjust),
         "goods_receipts_units": _compare(truth_receipts, gold_receipts, {}),
@@ -196,6 +219,18 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         "bank_closing_balance": _compare(truth_balance, gold_balance, {}),
         "stock_snapshots": _compare(truth_stock, gold_stock, {}),
     }
+    gold_vs_truth = {name: summary for name, (summary, _) in comparisons.items()}
+    verdicts = {name: v for name, (_, v) in comparisons.items()}
+    # Every comparison's cells start with a business date.
+    cells_by_date: dict[tuple[str, date], list[str]] = defaultdict(list)
+    for name, cells in verdicts.items():
+        for cell, verdict in cells.items():
+            cells_by_date[(name, cell[0])].append(verdict)
+
+    def date_ok(datasets: tuple[str, ...], d: date) -> bool:
+        """The datasets have data for ``d`` and none of it is wrong."""
+        found = [v for name in datasets for v in cells_by_date.get((name, d), [])]
+        return bool(found) and "wrong" not in found
 
     # ------------------------------------------------------------------ quarantine
     quarantined = {
@@ -229,13 +264,16 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         d = day(e["record_doc_date"])
         expected_x.add(("production_vs_sales", d, e["record_true_sku"]))
         expected_x.add(("customer_receipts", d, "ALL"))
-    flagged = {k for k in expected_x if status.get(k) not in (None, "matched")}
+    # A business error is caught only if it is reported as an exception (or is still open
+    # inside the late-arrival window). "Explained by quarantine" would hide it.
+    flagged = {k for k in expected_x if status.get(k) in ("exception", "open_late_window")}
+    masked = {k for k in expected_x if status.get(k) == "explained_by_quarantine"}
     reconciliation = {
         "exceptions": len(exceptions),
         "expected_business_errors": len(expected_x),
         "business_errors_flagged": len(flagged),
         "flagged_as_exception": len(expected_x & exceptions),
-        "masked_by_quarantine": len({k for k in flagged if status[k] == "explained_by_quarantine"}),
+        "masked_by_quarantine": len(masked),
         "unexpected_exceptions": sorted([list(map(str, k)) for k in exceptions - expected_x]),
         "status_counts": dict(Counter(status.values())),
     }
@@ -244,7 +282,8 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
     ingest_log = {
         (f, s)
         for f, s in lake.rows(
-            f"SELECT file, status FROM read_parquet('{lake_root}/_control/ingest_log/*.parquet')"
+            "SELECT file, status FROM read_parquet("
+            f"'{lake_root}/_control/ingest_log/*/*.parquet', hive_partitioning = false)"
         )
     }
     events = {
@@ -267,11 +306,39 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         (d, n): k
         for d, n, k in lake.rows(f"SELECT doc_no, line_no, sku FROM {lake.silver('invoice_lines')}")
     }
-    docs = {d for d, _ in lines}
     receipts = dict(lake.rows(f"SELECT gr_no, qty_base FROM {lake.silver('goods_receipts')}"))
-    wo_counts = Counter(
-        w for (w,) in lake.rows(f"SELECT work_order FROM {lake.gold('fct_maintenance')}")
+    completions = Counter(
+        w
+        for (w,) in lake.rows(
+            f"SELECT work_order FROM {lake.silver('work_order_events')} WHERE event = 'COMPLETED'"
+        )
     )
+    doc_types = {
+        d: t
+        for d, t in lake.rows(
+            f"SELECT DISTINCT doc_no, doc_type FROM {lake.silver('invoice_lines')}"
+        )
+    }
+    source_datasets = {
+        "mes_production": ("production_units",),
+        "mes_material_issues": ("material_issue_units",),
+        "erp_invoices": ("sales_units", "sales_revenue"),
+        "erp_goods_receipts": ("goods_receipts_units",),
+        "erp_stock_snapshots": ("stock_snapshots",),
+        "cmms_work_orders": ("maintenance_cost",),
+        "bank_statements": ("bank_closing_balance",),
+    }
+
+    def production_cell_ok(e: dict) -> bool:
+        cell = (day(e["record_business_date"]), e["record_true_station"], e["record_true_sku"])
+        return verdicts["production_units"].get(cell) in ("exact", "explained")
+
+    def sales_cell_ok(e: dict) -> bool:
+        cell = (day(e["record_doc_date"]), e["record_true_sku"])
+        return verdicts["sales_units"].get(cell) in ("exact", "explained") and verdicts[
+            "sales_revenue"
+        ].get(cell) in ("exact", "explained")
+
     loaded_files = {f for f, s in ingest_log if s == "loaded"}
     quarantined_files = Counter(f for f, _ in quarantined)
     lossy_per_file = Counter(f for f, _ in expected_q)
@@ -291,33 +358,49 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
             "re-delivered file skipped by content hash",
         ),
         "late_file": (
-            lambda e: e["file"] in loaded_files,
-            "loaded in a later batch under its business date",
+            lambda e: (
+                e["file"] in loaded_files
+                and date_ok(source_datasets[e["source"]], day(e["business_date"]))
+            ),
+            "loaded in a later batch; its business date's gold numbers match the truth",
         ),
         "header_repeat": (
             lambda e: quarantined_files[e["file"]] == lossy_per_file[e["file"]],
             "repeated header dropped, nothing else quarantined",
         ),
         "duplicate_row": (
-            lambda e: event_counts[e["key_event_id"]] == 1,
-            "one silver row per event id",
+            lambda e: event_counts[e["key_event_id"]] == 1 and production_cell_ok(e),
+            "one silver row per event id; the production total matches the truth",
         ),
         "corrected_resend": (
-            lambda e: events.get(e["key_event_id"], (None, None))[:2] == (e["qty"], 2),
-            "revision 2 wins over revision 1",
+            lambda e: (
+                events.get(e["key_event_id"], (None, None))[:2] == (e["qty"], 2)
+                and production_cell_ok(e)
+            ),
+            "revision 2 wins over revision 1; the production total matches the truth",
         ),
-        "code_variant": (code_variant_ok, "code mapped to its canonical value"),
+        "code_variant": (
+            code_variant_ok,
+            "mapped through the alias tables (maintained reference data; a code missing from "
+            "them is the unknown_code case)",
+        ),
         "uom_box": (
             lambda e: receipts.get(e["key_gr_no"]) == e["qty_ea"],
             "boxes of 25 converted to each",
         ),
         "duplicate_wo_event": (
-            lambda e: wo_counts[e["work_order"]] == 1,
-            "one maintenance fact per work order",
+            lambda e: (
+                completions[e["work_order"]] == 1
+                and date_ok(("maintenance_cost",), day(e["business_date"]))
+            ),
+            "one completion event survives; the work order's cost matches the truth",
         ),
         "reversed_invoice": (
-            lambda e: e["key_doc_no"] in docs,
-            "duplicate invoice and its credit memo both kept (net zero)",
+            lambda e: (
+                doc_types.get(e["key_doc_no"]) == ("CM" if e["role"] == "credit_memo" else "INV")
+                and sales_cell_ok(e)
+            ),
+            "duplicate invoice and credit memo both kept; the day's sales match the truth",
         ),
         "malformed_row": (
             lambda e: (e["file"], e["record_number"]) in quarantined,
@@ -334,9 +417,9 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         "double_keyed_line": (
             lambda e: (
                 status.get(("production_vs_sales", day(e["record_doc_date"]), e["record_true_sku"]))
-                not in (None, "matched")
+                in ("exception", "open_late_window")
             ),
-            "not row-detectable; flagged by reconciliation",
+            "not row-detectable; reconciliation reports it as an exception",
         ),
     }
     defects = []

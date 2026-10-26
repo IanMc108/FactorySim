@@ -1,0 +1,98 @@
+[
+  {
+    "defect_seed": 1,
+    "defects_injected": 4121,
+    "defects_handled": 4121,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 6,
+    "business_errors_flagged": 6,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  },
+  {
+    "defect_seed": 2,
+    "defects_injected": 4181,
+    "defects_handled": 4181,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 12,
+    "business_errors_flagged": 12,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  },
+  {
+    "defect_seed": 3,
+    "defects_injected": 4175,
+    "defects_handled": 4175,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 8,
+    "business_errors_flagged": 8,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  },
+  {
+    "defect_seed": 4,
+    "defects_injected": 4091,
+    "defects_handled": 4091,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 10,
+    "business_errors_flagged": 10,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  },
+  {
+    "defect_seed": 5,
+    "defects_injected": 4115,
+    "defects_handled": 4115,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 12,
+    "business_errors_flagged": 12,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  },
+  {
+    "defect_seed": 6,
+    "defects_injected": 4121,
+    "defects_handled": 4121,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 10,
+    "business_errors_flagged": 10,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  },
+  {
+    "defect_seed": 7,
+    "defects_injected": 4038,
+    "defects_handled": 4038,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 12,
+    "business_errors_flagged": 12,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  },
+  {
+    "defect_seed": 8,
+    "defects_injected": 4067,
+    "defects_handled": 4067,
+    "quarantine_precision": 1.0,
+    "quarantine_recall": 1.0,
+    "business_errors": 8,
+    "business_errors_flagged": 8,
+    "masked_by_quarantine": 0,
+    "unexpected_exceptions": 0,
+    "unexplained_cells": 0
+  }
+]

@@ -8,6 +8,7 @@ import duckdb
 from factorysim.config import SimConfig
 from factorysim.db import create_database
 from factorysim.etl.pipeline import ENTITIES, run_pipeline
+from factorysim.report import build_etl_results, sweep_summary
 from factorysim.simulation import run_simulation
 from factorysim.sources.export import export_sources
 
@@ -71,6 +72,16 @@ def test_reconciliation_flags_only_business_errors(full_year):
     r = full_year[2]["reconciliation"]
     assert r["unexpected_exceptions"] == []
     assert r["business_errors_flagged"] == r["expected_business_errors"] > 0
+
+
+def test_another_defect_seed_is_handled_as_well(tmp_path):
+    """The published scorecard is one seed; a different defect mix must hold up too."""
+    summary = sweep_summary(build_etl_results(tmp_path, defect_seed=3))
+    assert summary["defects_handled"] == summary["defects_injected"]
+    assert summary["quarantine_precision"] == summary["quarantine_recall"] == 1
+    assert summary["business_errors_flagged"] == summary["business_errors"] > 0
+    assert summary["masked_by_quarantine"] == summary["unexpected_exceptions"] == 0
+    assert summary["unexplained_cells"] == 0
 
 
 def test_rerun_without_new_files_changes_nothing(full_year, tmp_path):

@@ -5,16 +5,14 @@ WITH parsed AS (
         *,
         CAST(try_strptime(record ->> 'Date', '%m/%d/%Y') AS DATE) AS txn_date,
         trim(record ->> 'Description') AS description,
-        TRY_CAST(NULLIF(regexp_replace(record ->> 'Debit', '[$,\s]', '', 'g'), '')
-                 AS DECIMAL(18, 2)) AS debit,
-        TRY_CAST(NULLIF(regexp_replace(record ->> 'Credit', '[$,\s]', '', 'g'), '')
-                 AS DECIMAL(18, 2)) AS credit,
-        TRY_CAST(regexp_replace(record ->> 'Balance', '[$,\s]', '', 'g') AS DECIMAL(18, 2))
+        money(NULLIF(trim(record ->> 'Debit'), '')) AS debit,
+        money(NULLIF(trim(record ->> 'Credit'), '')) AS credit,
+        money(record ->> 'Balance')
             AS balance
     FROM bronze
 )
 SELECT
-    _source, _file, _record_number, _arrival_date, _file_business_date, _raw, record,
+    _source, _file, _record_number, _arrival_date, _file_business_date, _ingest_seq, _raw, record,
     CASE
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN txn_date IS NULL THEN 'invalid_date'

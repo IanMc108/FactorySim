@@ -829,7 +829,14 @@ def export_sources(
                 for key in ("event_id", "issue_id", "doc_no", "line_no", "gr_no", "work_order"):
                     if key in rec.data:
                         entry.setdefault("key_" + key, rec.data[key])
-                for key in ("true_station", "true_sku", "qty", "price", "doc_date"):
+                for key in (
+                    "true_station",
+                    "true_sku",
+                    "qty",
+                    "price",
+                    "doc_date",
+                    "business_date",
+                ):
                     if key in rec.data:
                         entry.setdefault("record_" + key, rec.data[key])
                 manifest.append(_jsonable(entry))

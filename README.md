@@ -71,24 +71,24 @@ One year of exports: 1,685 files and 24,650 records. The pipeline loaded 1,651 f
 | Defect | Injected | Handled | How |
 |---|---:|---:|---|
 | `duplicate_file` | 34 | 34 | re-delivered file skipped by content hash |
-| `late_file` | 81 | 81 | loaded in a later batch under its business date |
+| `late_file` | 81 | 81 | loaded in a later batch; its business date's gold numbers match the truth |
 | `header_repeat` | 40 | 40 | repeated header dropped, nothing else quarantined |
-| `duplicate_row` | 54 | 54 | one silver row per event id |
-| `corrected_resend` | 22 | 22 | revision 2 wins over revision 1 |
-| `code_variant` | 3,688 | 3,688 | code mapped to its canonical value |
+| `duplicate_row` | 54 | 54 | one silver row per event id; the production total matches the truth |
+| `corrected_resend` | 22 | 22 | revision 2 wins over revision 1; the production total matches the truth |
+| `code_variant` | 3,688 | 3,688 | mapped through the alias tables (maintained reference data; a code missing from them is the unknown_code case) |
 | `uom_box` | 34 | 34 | boxes of 25 converted to each |
-| `duplicate_wo_event` | 3 | 3 | one maintenance fact per work order |
-| `reversed_invoice` | 40 | 40 | duplicate invoice and its credit memo both kept (net zero) |
+| `duplicate_wo_event` | 3 | 3 | one completion event survives; the work order's cost matches the truth |
+| `reversed_invoice` | 40 | 40 | duplicate invoice and credit memo both kept; the day's sales match the truth |
 | `malformed_row` | 24 | 24 | quarantined with a reason |
 | `unknown_code` | 8 | 8 | quarantined as unknown_sku |
 | `missing_key` | 4 | 4 | quarantined as missing_key |
-| `double_keyed_line` | 6 | 6 | not row-detectable; flagged by reconciliation |
+| `double_keyed_line` | 6 | 6 | not row-detectable; reconciliation reports it as an exception |
 
 **Quarantine:** 36 records quarantined; precision 100% and recall 100% against the injected unrecoverable records, 36 of 36 with the expected reason code.
 
 | Reconciliation check | Rows | Matched | Explained by quarantine | Open (late window) | Exceptions |
 |---|---:|---:|---:|---:|---:|
-| `bank_balance_continuity` | 365 | 365 | 0 | 0 | 0 |
+| `bank_balance_continuity` | 517 | 517 | 0 | 0 | 0 |
 | `customer_receipts` | 365 | 342 | 17 | 1 | 5 |
 | `inventory_roll_forward` | 156 | 156 | 0 | 0 | 0 |
 | `maintenance_payments` | 12 | 12 | 0 | 0 | 0 |
@@ -96,13 +96,14 @@ One year of exports: 1,685 files and 24,650 records. The pipeline loaded 1,651 f
 | `production_vs_sales` | 1,460 | 1,424 | 30 | 1 | 5 |
 | `supplier_payments` | 140 | 140 | 0 | 0 | 0 |
 
-All 10 exceptions are injected business errors, and 12 of 12 business-error checks were flagged (2 still inside the late-arrival window at the end of the year). Unexpected exceptions: 0.
+12 of 12 checks touched by an injected billing error report it (10 as exceptions, 2 still open inside the late-arrival window at the end of the year); 0 are hidden as "explained". Exceptions that are not injected errors: 0.
 
 **Gold vs. ground truth** (cells compared against the simulator's database):
 
 | Dataset | Cells | Exact | Differs only by injected losses | Unexplained |
 |---|---:|---:|---:|---:|
 | production units | 5,020 | 5,002 | 18 | 0 |
+| material issue units | 2,190 | 2,190 | 0 | 0 |
 | sales units | 1,460 | 1,436 | 24 | 0 |
 | sales revenue | 1,460 | 1,436 | 24 | 0 |
 | goods receipts units | 140 | 140 | 0 | 0 |
@@ -110,16 +111,40 @@ All 10 exceptions are injected business errors, and 12 of 12 business-error chec
 | bank closing balance | 365 | 365 | 0 | 0 |
 | stock snapshots | 159 | 159 | 0 | 0 |
 
+**The same run for 8 defect seeds** (each injects a different set of defects; the tables above are seed 7):
+
+| Seed | Defects handled | Quarantine P / R | Billing errors reported | Masked | Unexpected exceptions | Unexplained cells |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 4,121 / 4,121 | 100% / 100% | 6 / 6 | 0 | 0 | 0 |
+| 2 | 4,181 / 4,181 | 100% / 100% | 12 / 12 | 0 | 0 | 0 |
+| 3 | 4,175 / 4,175 | 100% / 100% | 8 / 8 | 0 | 0 | 0 |
+| 4 | 4,091 / 4,091 | 100% / 100% | 10 / 10 | 0 | 0 | 0 |
+| 5 | 4,115 / 4,115 | 100% / 100% | 12 / 12 | 0 | 0 | 0 |
+| 6 | 4,121 / 4,121 | 100% / 100% | 10 / 10 | 0 | 0 | 0 |
+| 7 | 4,038 / 4,038 | 100% / 100% | 12 / 12 | 0 | 0 | 0 |
+| 8 | 4,067 / 4,067 | 100% / 100% | 8 / 8 | 0 | 0 | 0 |
+
 <!-- etl:end -->
 
 ### How it works
 
-- **Bronze keeps everything.** Every record of every accepted file is stored untyped, including the ones that do not parse. Each one carries its file, SHA-256, arrival date, business date and record number, so silver can always be rebuilt and any gold number can be traced back to a line in a file.
-- **Incremental and idempotent.** Files are identified by content hash, so re-runs and re-deliveries never double-load. Each run recomputes silver from bronze but rewrites only the monthly partitions that its new files touched (dynamic partition overwrite). Gold and reconciliation are small and are rebuilt in full. A test runs the year in uneven batches, one of them straddling the MES schema change, and asserts the result is identical to one full run.
-- **Deduplication removes copies, not transactions.** Only records with the same natural key collapse. A credit memo that reverses a duplicate invoice stays, and a billing error surfaces in reconciliation rather than being silently "fixed".
-- **Quarantine instead of drop or guess.** Every rejected record keeps its raw text and gets a reason code. A reconciliation variance on a day with related quarantined records is labelled *explained*. Variances within 7 days of the latest arrival are labelled *open*, because late files may still come.
+- **Bronze keeps everything.** Every record of every accepted file version is stored untyped, including the ones that do not parse. Each one carries its file, SHA-256, arrival date, business date, ingest sequence and record number, so silver can always be rebuilt and any gold number can be traced back to a line in a file.
+- **File versions, not just files.** A file is identified by its path and content hash:
+  - a re-delivered copy is skipped;
+  - a file re-issued under the same name, whether overwritten in place or re-sent later, replaces every record of the old version;
+  - a file that cannot be read (bad name, undecodable bytes) is logged as rejected while the rest of the batch carries on.
+
+  Each file's bronze data and log entry are committed atomically, and crash leftovers are cleaned up on the next run.
+- **Incremental and idempotent.** Each run recomputes silver from bronze, fingerprints every monthly partition and rewrites only the months whose content changed. It also deletes months left empty, so a correction that moves a record from May to June fixes both months. Gold and reconciliation are small and are rebuilt in full. Tests run the year in uneven batches and compare against one full run, and re-running with no new files changes nothing.
+- **Deduplication removes copies, not transactions.** Records with the same natural key collapse to the newest extract, or the highest revision where the feed has one. A credit memo that reverses a duplicate invoice stays, and a billing error surfaces in reconciliation rather than being silently "fixed".
+- **Quarantine instead of drop or guess.** Every rejected record keeps its raw text and gets a reason code. Numbers are parsed strictly: `10.5`, `1e3` and `1_000` are rejected, never rounded.
+- **Explanations must add up.** A reconciliation variance counts as *explained by quarantine* only when it equals the effect of the related quarantined records, matched by station, SKU or reference. The pipeline recovers a lost record's size where it can, for example from the station's material issues. Variances within 7 days of the latest arrival are *open*, because late files may still come. Anything else is an *exception*.
 - **Time is explicit.** Plant-local MES timestamps (America/Chicago, DST included) are converted to UTC, and post-midnight night-shift events belong to the production day the shift started on.
 - **Transformations are SQL-first.** The SQL lives in versioned [`.sql` files](factorysim/etl/sql/), and Python only handles ingestion and orchestration.
+
+**What the scorecard does and does not prove:** it grades the pipeline against defects the same project injects. Two things guard against that being circular:
+- every check verifies an outcome against the truth (for example, that the late file's day has correct gold numbers), not just that a mechanism ran;
+- the pipeline is also tested on hand-made hostile inputs outside the exporter's catalog ([`tests/test_etl_hostile.py`](tests/test_etl_hostile.py)), which came from an [adversarial review](docs/review-log.md).
 
 More detail, including the lake layout, the run model, the AWS mapping and the known limits, is in [docs/etl-design.md](docs/etl-design.md).
 
@@ -222,8 +247,8 @@ ruff check .                             # lint
 
 ## Assumptions and limitations
 
-- **Data volume:** the data is small, about 25k records a year, and the pipeline runs on one machine. Silver recomputation reads all of bronze on every run. That is fine at this size, but at scale it would prune by arrival partition with a lookback window (see [docs/etl-design.md](docs/etl-design.md)).
-- **Coarse quarantine explanations:** a variance counts as "explained" when the same day has quarantined records from a related feed. A genuine business error on such a day would be masked, and the evaluator reports how many were.
+- **Data volume:** the data is small, about 25k records a year, and the pipeline runs on one machine. Every run reads all of bronze to recompute silver: correct and fast here, but O(history). Bronze is also many small files that store records as JSON text. [docs/etl-design.md](docs/etl-design.md) covers what changes at scale (a table format with `MERGE`, compaction, typed bronze).
+- **Unsized quarantined records:** when a related quarantined record's size cannot be recovered (for example a truncated invoice line), any variance on that row still counts as explained. Across eight defect seeds this hid no injected error, but it could.
 - **Simple business model:** everything good is sold the day it is made, at list price, and paid for the same day. Purchases are paid on receipt. There is no demand model, labour or overhead, so the cash figures are not profit.
 - **Simple maintenance model:** a service takes no production time, and decay is deterministic in expectation (only the grading is random).
 - **Model type:** the simulator is a daily time-step Monte Carlo model, not a discrete-event simulation.
@@ -244,7 +269,7 @@ factorysim/
   evaluation.py                     scores the lake against the truth
   report.py, cli.py                 generated docs and the command line
 aws/glue/                           Glue (PySpark) port of the MES silver step
-tests/                              pytest suite
+tests/                              pytest suite (incl. hostile inputs and Glue parity)
 docs/                               generated results, charts, samples, design notes
 ```
 

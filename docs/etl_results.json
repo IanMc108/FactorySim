@@ -1,4 +1,5 @@
 {
+  "defect_seed": 7,
   "export": {
     "files_written": 1685,
     "records_written": 24650,
@@ -83,8 +84,8 @@
     ],
     "recon": {
       "bank_balance_continuity": {
-        "rows": 365,
-        "matched": 365,
+        "rows": 517,
+        "matched": 517,
         "explained": 0,
         "open": 0,
         "exceptions": 0
@@ -146,7 +147,7 @@
         "defect": "late_file",
         "injected": 81,
         "handled": 81,
-        "how": "loaded in a later batch under its business date"
+        "how": "loaded in a later batch; its business date's gold numbers match the truth"
       },
       {
         "defect": "header_repeat",
@@ -158,19 +159,19 @@
         "defect": "duplicate_row",
         "injected": 54,
         "handled": 54,
-        "how": "one silver row per event id"
+        "how": "one silver row per event id; the production total matches the truth"
       },
       {
         "defect": "corrected_resend",
         "injected": 22,
         "handled": 22,
-        "how": "revision 2 wins over revision 1"
+        "how": "revision 2 wins over revision 1; the production total matches the truth"
       },
       {
         "defect": "code_variant",
         "injected": 3688,
         "handled": 3688,
-        "how": "code mapped to its canonical value"
+        "how": "mapped through the alias tables (maintained reference data; a code missing from them is the unknown_code case)"
       },
       {
         "defect": "uom_box",
@@ -182,13 +183,13 @@
         "defect": "duplicate_wo_event",
         "injected": 3,
         "handled": 3,
-        "how": "one maintenance fact per work order"
+        "how": "one completion event survives; the work order's cost matches the truth"
       },
       {
         "defect": "reversed_invoice",
         "injected": 40,
         "handled": 40,
-        "how": "duplicate invoice and its credit memo both kept (net zero)"
+        "how": "duplicate invoice and credit memo both kept; the day's sales match the truth"
       },
       {
         "defect": "malformed_row",
@@ -212,7 +213,7 @@
         "defect": "double_keyed_line",
         "injected": 6,
         "handled": 6,
-        "how": "not row-detectable; flagged by reconciliation"
+        "how": "not row-detectable; reconciliation reports it as an exception"
       }
     ],
     "quarantine": {
@@ -231,7 +232,7 @@
       "masked_by_quarantine": 0,
       "unexpected_exceptions": [],
       "status_counts": {
-        "matched": 4611,
+        "matched": 4763,
         "exception": 10,
         "explained_by_quarantine": 65,
         "open_late_window": 2
@@ -242,6 +243,13 @@
         "cells": 5020,
         "exact": 5002,
         "explained_by_injected_defects": 18,
+        "unexplained": 0,
+        "unexplained_examples": []
+      },
+      "material_issue_units": {
+        "cells": 2190,
+        "exact": 2190,
+        "explained_by_injected_defects": 0,
         "unexplained": 0,
         "unexplained_examples": []
       },
