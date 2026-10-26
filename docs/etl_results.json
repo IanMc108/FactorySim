@@ -1,19 +1,23 @@
 {
   "defect_seed": 7,
+  "batch_days": null,
   "export": {
-    "files_written": 1685,
-    "records_written": 24650,
+    "files_written": 1679,
+    "records_written": 24613,
     "defects": {
-      "code_variant": 3688,
+      "code_variant": 3683,
       "corrected_resend": 22,
       "double_keyed_line": 6,
-      "duplicate_file": 34,
+      "double_payment": 1,
+      "duplicate_file": 29,
       "duplicate_row": 54,
       "duplicate_row_original": 54,
       "duplicate_wo_event": 3,
-      "header_repeat": 40,
-      "late_file": 81,
+      "header_repeat": 39,
+      "late_file": 88,
+      "late_payment": 3,
       "malformed_row": 24,
+      "missing_file": 1,
       "missing_key": 4,
       "reversed_invoice": 40,
       "superseded_revision": 22,
@@ -22,15 +26,15 @@
     }
   },
   "pipeline": {
-    "files_loaded": 1651,
-    "duplicate_files": 34,
+    "files_loaded": 1650,
+    "duplicate_files": 29,
     "entities": [
       {
         "entity": "production_events",
-        "records": 14190,
+        "records": 14152,
         "rejected": 18,
         "duplicates_removed": 76,
-        "rows": 14096,
+        "rows": 14058,
         "partitions_written": 12
       },
       {
@@ -75,26 +79,36 @@
       },
       {
         "entity": "bank_transactions",
-        "records": 518,
+        "records": 519,
         "rejected": 0,
         "duplicates_removed": 0,
-        "rows": 518,
+        "rows": 519,
         "partitions_written": 12
       }
     ],
     "recon": {
       "bank_balance_continuity": {
-        "rows": 517,
-        "matched": 517,
+        "rows": 518,
+        "matched": 518,
         "explained": 0,
         "open": 0,
+        "needs_review": 0,
+        "exceptions": 0
+      },
+      "credit_memo_references": {
+        "rows": 5,
+        "matched": 5,
+        "explained": 0,
+        "open": 0,
+        "needs_review": 0,
         "exceptions": 0
       },
       "customer_receipts": {
         "rows": 365,
         "matched": 342,
-        "explained": 17,
+        "explained": 13,
         "open": 1,
+        "needs_review": 4,
         "exceptions": 5
       },
       "inventory_roll_forward": {
@@ -102,6 +116,7 @@
         "matched": 156,
         "explained": 0,
         "open": 0,
+        "needs_review": 0,
         "exceptions": 0
       },
       "maintenance_payments": {
@@ -109,111 +124,151 @@
         "matched": 12,
         "explained": 0,
         "open": 0,
+        "needs_review": 0,
         "exceptions": 0
       },
       "mass_balance": {
         "rows": 2190,
-        "matched": 2172,
-        "explained": 18,
+        "matched": 2166,
+        "explained": 0,
         "open": 0,
-        "exceptions": 0
+        "needs_review": 18,
+        "exceptions": 6
       },
       "production_vs_sales": {
         "rows": 1460,
-        "matched": 1424,
-        "explained": 30,
+        "matched": 1420,
+        "explained": 24,
         "open": 1,
-        "exceptions": 5
+        "needs_review": 6,
+        "exceptions": 9
       },
       "supplier_payments": {
-        "rows": 140,
-        "matched": 140,
+        "rows": 143,
+        "matched": 136,
         "explained": 0,
         "open": 0,
-        "exceptions": 0
+        "needs_review": 0,
+        "exceptions": 7
       }
     }
   },
   "evaluation": {
-    "manifest_entries": 4114,
+    "manifest_entries": 4115,
+    "batches": 1,
+    "late_files_in_later_batch": 0,
     "defects": [
       {
         "defect": "duplicate_file",
-        "injected": 34,
-        "handled": 34,
-        "how": "re-delivered file skipped by content hash"
+        "kind": "data",
+        "injected": 29,
+        "handled": 29,
+        "how": "re-delivered copy not loaded again; its business date's gold numbers match the truth"
       },
       {
         "defect": "late_file",
-        "injected": 81,
-        "handled": 81,
-        "how": "loaded in a later batch; its business date's gold numbers match the truth"
+        "kind": "data",
+        "injected": 88,
+        "handled": 88,
+        "how": "loaded after its business date (a later batch when run incrementally); that date's gold numbers match the truth"
       },
       {
         "defect": "header_repeat",
-        "injected": 40,
-        "handled": 40,
+        "kind": "data",
+        "injected": 39,
+        "handled": 39,
         "how": "repeated header dropped, nothing else quarantined"
       },
       {
         "defect": "duplicate_row",
+        "kind": "data",
         "injected": 54,
         "handled": 54,
         "how": "one silver row per event id; the production total matches the truth"
       },
       {
         "defect": "corrected_resend",
+        "kind": "data",
         "injected": 22,
         "handled": 22,
         "how": "revision 2 wins over revision 1; the production total matches the truth"
       },
       {
         "defect": "code_variant",
-        "injected": 3688,
-        "handled": 3688,
+        "kind": "normalization",
+        "injected": 3683,
+        "handled": 3683,
         "how": "mapped through the alias tables (maintained reference data; a code missing from them is the unknown_code case)"
       },
       {
         "defect": "uom_box",
+        "kind": "data",
         "injected": 34,
         "handled": 34,
         "how": "boxes of 25 converted to each"
       },
       {
         "defect": "duplicate_wo_event",
+        "kind": "data",
         "injected": 3,
         "handled": 3,
         "how": "one completion event survives; the work order's cost matches the truth"
       },
       {
         "defect": "reversed_invoice",
+        "kind": "data",
         "injected": 40,
         "handled": 40,
         "how": "duplicate invoice and credit memo both kept; the day's sales match the truth"
       },
       {
         "defect": "malformed_row",
+        "kind": "data",
         "injected": 24,
         "handled": 24,
-        "how": "quarantined with a reason"
+        "how": "quarantined with the right reason; gold differs from the truth by exactly the lost record"
       },
       {
         "defect": "unknown_code",
+        "kind": "data",
         "injected": 8,
         "handled": 8,
-        "how": "quarantined as unknown_sku"
+        "how": "quarantined as unknown_sku, never guessed; gold differs by exactly the lost line"
       },
       {
         "defect": "missing_key",
+        "kind": "data",
         "injected": 4,
         "handled": 4,
-        "how": "quarantined as missing_key"
+        "how": "quarantined as missing_key; gold differs by exactly the lost line"
       },
       {
         "defect": "double_keyed_line",
+        "kind": "business_error",
         "injected": 6,
         "handled": 6,
-        "how": "not row-detectable; reconciliation reports it as an exception"
+        "how": "billing error: production vs. sales and deposits flag it"
+      },
+      {
+        "defect": "double_payment",
+        "kind": "business_error",
+        "injected": 1,
+        "handled": 1,
+        "how": "PO paid twice: supplier-payment check flags it"
+      },
+      {
+        "defect": "late_payment",
+        "kind": "business_error",
+        "injected": 3,
+        "handled": 3,
+        "how": "PO paid outside terms: both the PO and the payment are flagged"
+      },
+      {
+        "defect": "missing_file",
+        "kind": "business_error",
+        "injected": 1,
+        "handled": 1,
+        "how": "MES file never arrives: mass balance and sales checks flag it"
       }
     ],
     "quarantine": {
@@ -225,24 +280,28 @@
       "correct_reason": 36
     },
     "reconciliation": {
-      "exceptions": 10,
-      "expected_business_errors": 12,
-      "business_errors_flagged": 12,
-      "flagged_as_exception": 10,
+      "exceptions": 27,
+      "expected_business_errors": 29,
+      "business_errors_flagged": 29,
+      "flagged_as_exception": 27,
+      "flagged_for_review": 0,
       "masked_by_quarantine": 0,
+      "missed": [],
       "unexpected_exceptions": [],
+      "rows_needing_review": 28,
       "status_counts": {
-        "matched": 4763,
-        "exception": 10,
-        "explained_by_quarantine": 65,
+        "matched": 4755,
+        "exception": 27,
+        "needs_review": 28,
+        "explained_by_quarantine": 37,
         "open_late_window": 2
       }
     },
     "gold_vs_truth": {
       "production_units": {
         "cells": 5020,
-        "exact": 5002,
-        "explained_by_injected_defects": 18,
+        "exact": 4989,
+        "explained_by_injected_defects": 31,
         "unexplained": 0,
         "unexplained_examples": []
       },
@@ -283,8 +342,8 @@
       },
       "bank_closing_balance": {
         "cells": 365,
-        "exact": 365,
-        "explained_by_injected_defects": 0,
+        "exact": 329,
+        "explained_by_injected_defects": 36,
         "unexplained": 0,
         "unexplained_examples": []
       },

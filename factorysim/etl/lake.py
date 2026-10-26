@@ -4,7 +4,7 @@
     <lake>/silver/<entity>/business_month=YYYY-MM/part-0.parquet
     <lake>/quarantine/<source>/business_month=YYYY-MM/part-0.parquet
     <lake>/gold/<table>/part-0.parquet
-    <lake>/_control/ingest_log/batch_id=<id>/<seq>.parquet   one entry per file version
+    <lake>/_control/ingest_log/batch_id=<id>/batch.parquet   one row per file arrival
     <lake>/catalog.duckdb   views over all of the above (rebuilt every run)
 
 Everything except catalog.duckdb is plain Parquet, so the layout maps directly onto S3
@@ -14,6 +14,8 @@ prefixes with the Glue Data Catalog in place of catalog.duckdb.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -41,6 +43,8 @@ INGEST_LOG_SCHEMA = pa.schema(
         ("records", pa.int64()),
         ("header_repeats", pa.int64()),
         ("parse_errors", pa.int64()),
+        ("size", pa.int64()),
+        ("mtime_ns", pa.int64()),
         ("ingested_at", pa.timestamp("us")),
     ]
 )
@@ -109,7 +113,8 @@ class Lake:
         if not glob:
             return []
         cursor = conn.execute(
-            f"SELECT * FROM read_parquet('{glob}', hive_partitioning = false) ORDER BY seq"
+            f"SELECT * FROM read_parquet('{glob}', hive_partitioning = false, "
+            "union_by_name = true) ORDER BY seq"
         )
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
@@ -144,6 +149,8 @@ class Lake:
             "records": r.records,
             "header_repeats": r.header_repeats,
             "parse_errors": r.parse_errors,
+            "size": f.size,
+            "mtime_ns": f.mtime_ns,
             "ingested_at": datetime.now(timezone.utc).replace(tzinfo=None),
         }
         table = pa.Table.from_pylist([row], schema=INGEST_LOG_SCHEMA)
@@ -152,19 +159,79 @@ class Lake:
         )
         atomic_write_table(table, target)
 
-    def remove_orphan_bronze(self, conn: duckdb.DuckDBPyConnection) -> list[Path]:
-        """Delete bronze files with no ingest-log entry (left by a crash mid-file)."""
+    def compact_ingest_log(self, batch_id: str) -> None:
+        """Merge a batch's per-file log entries into one file (they stay valid if we crash)."""
+        batch_dir = self.root / "_control" / "ingest_log" / f"batch_id={batch_id}"
+        entries = sorted(p for p in batch_dir.glob("*.parquet") if p.name != "batch.parquet")
+        if not entries:
+            return
+        tables = [pq.read_table(p, schema=INGEST_LOG_SCHEMA) for p in entries]
+        existing = batch_dir / "batch.parquet"
+        if existing.exists():
+            tables.insert(0, pq.read_table(existing, schema=INGEST_LOG_SCHEMA))
+        atomic_write_table(pa.concat_tables(tables), existing)
+        for p in entries:
+            p.unlink()
+
+    def current_versions(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Create temp table current_versions(source, file_name, sha256) from the log.
+
+        The current version of a file name is its loaded or duplicate entry with the latest
+        arrival date, then the latest ingest sequence.
+        """
+        glob = self._log_glob()
+        source = (
+            f"read_parquet('{glob}', hive_partitioning = false, union_by_name = true)"
+            if glob
+            else "(SELECT NULL::VARCHAR AS source, NULL::VARCHAR AS file, NULL::VARCHAR AS sha256, "
+            "NULL::DATE AS arrival_date, NULL::BIGINT AS seq, NULL::VARCHAR AS status) WHERE false"
+        )
+        conn.execute(
+            f"""CREATE OR REPLACE TEMP TABLE current_versions AS
+                SELECT source, regexp_extract(file, '[^/]+$') AS file_name, sha256
+                FROM {source}
+                WHERE status IN ('loaded', 'duplicate_content')
+                QUALIFY row_number() OVER (
+                    PARTITION BY source, regexp_extract(file, '[^/]+$')
+                    ORDER BY arrival_date DESC, seq DESC) = 1"""
+        )
+
+    def remove_orphan_bronze(self, conn: duckdb.DuckDBPyConnection) -> set[Path]:
+        """Delete bronze files with no ingest-log entry (left by a crash mid-file).
+
+        Lists bronze once and returns the bronze files that remain.
+        """
         expected = {
             self.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
             for r in self.ingest_log(conn)
             if r["status"] == "loaded"
         }
-        orphans = [p for p in (self.root / "bronze").glob("*/*/*.parquet") if p not in expected]
-        for p in orphans:
+        present = set((self.root / "bronze").glob("*/*/*.parquet"))
+        for p in present - expected:
             p.unlink()
-        for tmp in self.root.rglob("*.tmp"):
-            tmp.unlink()
-        return orphans
+        for folder in ("bronze", "_control"):
+            for tmp in (self.root / folder).rglob("*.tmp"):
+                tmp.unlink()
+        return present & expected
+
+    @contextmanager
+    def lock(self) -> Iterator[None]:
+        """Refuse to run two pipelines against the same lake at once."""
+        path = self.root / "_control" / "run.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise RuntimeError(
+                f"{path} exists: another run is in progress, or one crashed "
+                "(delete the file once you are sure no run is active)"
+            ) from None
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+            os.close(fd)
+            yield
+        finally:
+            path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------ catalog
 

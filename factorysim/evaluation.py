@@ -17,6 +17,11 @@ import duckdb
 from .sources.export import MATERIAL_CODES, STATION_CODES, business_date
 
 LOSSY_DEFECTS = {"malformed_row", "unknown_code", "missing_key"}
+# Errors in the business data itself, which no row-level rule can see.
+BUSINESS_ERRORS = ("double_keyed_line", "double_payment", "late_payment", "missing_file")
+# Defects that are fixed by mapping through maintained reference data, reported apart from
+# the rest because the alias tables are written to match the exporter's legacy codes.
+NORMALIZATIONS = ("code_variant",)
 EXPECTED_REASON = {
     ("malformed_row", "truncated"): "malformed_record",
     ("malformed_row", "bad_qty"): "invalid_quantity",
@@ -107,6 +112,10 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         if e["source"] == "mes_production":
             cell = (day(e["record_business_date"]), e["record_true_station"], e["record_true_sku"])
             production_adjust[cell] -= e["record_qty"]
+    missing_days = {day(e["business_date"]) for e in by_defect["missing_file"]}
+    for cell, units in truth_production.items():
+        if cell[0] in missing_days:
+            production_adjust[cell] -= units
 
     truth_sales_units, truth_sales_revenue = {}, {}
     for d, p, units, revenue in truth.execute(
@@ -179,6 +188,15 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         "SELECT sim_day, balance_after FROM financial_ledger ORDER BY transaction_id"
     ):
         truth_balance[(business_date(max(d, 1)),)] = balance
+    # The bank is the real world: an injected double or late payment changes its balance.
+    balance_adjust: Counter = Counter()
+    for (d,) in truth_balance:
+        for e in by_defect["double_payment"]:
+            if d >= day(e["receipt_date"]):
+                balance_adjust[(d,)] -= e["amount"]
+        for e in by_defect["late_payment"]:
+            if day(e["receipt_date"]) <= d < day(e["paid_date"]):
+                balance_adjust[(d,)] += e["amount"]
     gold_balance = {}
     for d, balance in lake.rows(
         f"SELECT txn_date, balance FROM {lake.gold('fct_bank_transactions')} ORDER BY line_seq"
@@ -216,7 +234,7 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
         "sales_revenue": _compare(truth_sales_revenue, gold_revenue, revenue_adjust),
         "goods_receipts_units": _compare(truth_receipts, gold_receipts, {}),
         "maintenance_cost": _compare(truth_maintenance, gold_maintenance, {}),
-        "bank_closing_balance": _compare(truth_balance, gold_balance, {}),
+        "bank_closing_balance": _compare(truth_balance, gold_balance, balance_adjust),
         "stock_snapshots": _compare(truth_stock, gold_stock, {}),
     }
     gold_vs_truth = {name: summary for name, (summary, _) in comparisons.items()}
@@ -259,22 +277,57 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
     )
     status = {(c, d, k): s for c, d, k, s in recon}
     exceptions = {(c, d, k) for (c, d, k), s in status.items() if s == "exception"}
-    expected_x = set()
-    for e in by_defect["double_keyed_line"]:
-        d = day(e["record_doc_date"])
-        expected_x.add(("production_vs_sales", d, e["record_true_sku"]))
-        expected_x.add(("customer_receipts", d, "ALL"))
-    # A business error is caught only if it is reported as an exception (or is still open
-    # inside the late-arrival window). "Explained by quarantine" would hide it.
-    flagged = {k for k in expected_x if status.get(k) in ("exception", "open_late_window")}
+    sellable = {sku for _, sku in truth_sales_units}
+    stations = sorted(set(STATION_CODES.values()))
+
+    def expected_rows(e: dict) -> set[tuple]:
+        """The reconciliation rows an injected business error must show up in."""
+        if e["defect"] == "double_keyed_line":
+            d = day(e["record_doc_date"])
+            return {
+                ("production_vs_sales", d, e["record_true_sku"]),
+                ("customer_receipts", d, "ALL"),
+            }
+        if e["defect"] == "double_payment":
+            return {("supplier_payments", day(e["receipt_date"]), e["po"])}
+        if e["defect"] == "late_payment":
+            return {
+                ("supplier_payments", day(e["receipt_date"]), e["po"]),
+                (
+                    "supplier_payments",
+                    day(e["paid_date"]),
+                    f"{e['po']} (payment outside terms or without receipt)",
+                ),
+            }
+        if e["defect"] == "missing_file":
+            d = day(e["business_date"])
+            return {("mass_balance", d, s) for s in stations} | {
+                ("production_vs_sales", d, sku)
+                for sku in sellable
+                if truth_sales_units.get((d, sku))
+            }
+        raise ValueError(e["defect"])
+
+    business_errors = [e for name in BUSINESS_ERRORS for e in by_defect[name]]
+    expected_x = (
+        set().union(*(expected_rows(e) for e in business_errors)) if business_errors else set()
+    )
+    # A business error is caught only if it surfaces: as an exception, as a row a person has
+    # to review, or still open inside the late-arrival window. "Explained by quarantine"
+    # would hide it, and counts as missed.
+    surfaced_statuses = ("exception", "needs_review", "open_late_window")
+    flagged = {k for k in expected_x if status.get(k) in surfaced_statuses}
     masked = {k for k in expected_x if status.get(k) == "explained_by_quarantine"}
     reconciliation = {
         "exceptions": len(exceptions),
         "expected_business_errors": len(expected_x),
         "business_errors_flagged": len(flagged),
         "flagged_as_exception": len(expected_x & exceptions),
+        "flagged_for_review": len({k for k in expected_x if status.get(k) == "needs_review"}),
         "masked_by_quarantine": len(masked),
+        "missed": sorted([list(map(str, k)) for k in expected_x - flagged]),
         "unexpected_exceptions": sorted([list(map(str, k)) for k in exceptions - expected_x]),
+        "rows_needing_review": sum(s == "needs_review" for s in status.values()),
         "status_counts": dict(Counter(status.values())),
     }
 
@@ -354,15 +407,19 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
 
     checks = {
         "duplicate_file": (
-            lambda e: (e["file"], "duplicate_content") in ingest_log,
-            "re-delivered file skipped by content hash",
+            lambda e: (
+                (e["file"], "duplicate_content") in ingest_log
+                and date_ok(source_datasets[e["source"]], day(e["business_date"]))
+            ),
+            "re-delivered copy not loaded again; its business date's gold numbers match the truth",
         ),
         "late_file": (
             lambda e: (
                 e["file"] in loaded_files
                 and date_ok(source_datasets[e["source"]], day(e["business_date"]))
             ),
-            "loaded in a later batch; its business date's gold numbers match the truth",
+            "loaded after its business date (a later batch when run incrementally); that "
+            "date's gold numbers match the truth",
         ),
         "header_repeat": (
             lambda e: quarantined_files[e["file"]] == lossy_per_file[e["file"]],
@@ -403,33 +460,77 @@ def evaluate(truth_db: Path, manifest_path: Path, lake_root: Path) -> dict:
             "duplicate invoice and credit memo both kept; the day's sales match the truth",
         ),
         "malformed_row": (
-            lambda e: (e["file"], e["record_number"]) in quarantined,
-            "quarantined with a reason",
+            lambda e: (
+                quarantined.get((e["file"], e["record_number"]))
+                == EXPECTED_REASON[("malformed_row", e["mode"])]
+                and (production_cell_ok(e) if e["source"] == "mes_production" else sales_cell_ok(e))
+            ),
+            "quarantined with the right reason; gold differs from the truth by exactly the lost "
+            "record",
         ),
         "unknown_code": (
-            lambda e: quarantined.get((e["file"], e["record_number"])) == "unknown_sku",
-            "quarantined as unknown_sku",
+            lambda e: (
+                quarantined.get((e["file"], e["record_number"])) == "unknown_sku"
+                and sales_cell_ok(e)
+            ),
+            "quarantined as unknown_sku, never guessed; gold differs by exactly the lost line",
         ),
         "missing_key": (
-            lambda e: quarantined.get((e["file"], e["record_number"])) == "missing_key",
-            "quarantined as missing_key",
-        ),
-        "double_keyed_line": (
             lambda e: (
-                status.get(("production_vs_sales", day(e["record_doc_date"]), e["record_true_sku"]))
-                in ("exception", "open_late_window")
+                quarantined.get((e["file"], e["record_number"])) == "missing_key"
+                and sales_cell_ok(e)
             ),
-            "not row-detectable; reconciliation reports it as an exception",
+            "quarantined as missing_key; gold differs by exactly the lost line",
         ),
+        **{
+            name: (
+                lambda e: all(status.get(k) in surfaced_statuses for k in expected_rows(e)),
+                how,
+            )
+            for name, how in (
+                ("double_keyed_line", "billing error: production vs. sales and deposits flag it"),
+                ("double_payment", "PO paid twice: supplier-payment check flags it"),
+                ("late_payment", "PO paid outside terms: both the PO and the payment are flagged"),
+                ("missing_file", "MES file never arrives: mass balance and sales checks flag it"),
+            )
+        },
     }
     defects = []
     for name, (check, how) in checks.items():
         entries = by_defect[name]
         handled = sum(bool(check(e)) for e in entries)
-        defects.append({"defect": name, "injected": len(entries), "handled": handled, "how": how})
+        kind = (
+            "normalization"
+            if name in NORMALIZATIONS
+            else "business_error"
+            if name in BUSINESS_ERRORS
+            else "data"
+        )
+        defects.append(
+            {"defect": name, "kind": kind, "injected": len(entries), "handled": handled, "how": how}
+        )
+
+    # With incremental runs, did late files really arrive in a later batch than the day
+    # they belong to? (Always 0 for a single run.)
+    batches = lake.rows(
+        "SELECT file, batch_id, arrival_date, file_business_date FROM read_parquet("
+        f"'{lake_root}/_control/ingest_log/*/*.parquet', hive_partitioning = false)"
+    )
+    first_batch_of_day: dict = {}
+    for _, batch, arrival, _ in batches:
+        if arrival not in first_batch_of_day or batch < first_batch_of_day[arrival]:
+            first_batch_of_day[arrival] = batch
+    batch_of = {f: b for f, b, _, _ in batches}
+    late_in_later_batch = sum(
+        1
+        for e in by_defect["late_file"]
+        if batch_of.get(e["file"], "") > first_batch_of_day.get(day(e["business_date"]), "~")
+    )
 
     return {
         "manifest_entries": len(manifest),
+        "batches": len({b for _, b, _, _ in batches}),
+        "late_files_in_later_batch": late_in_later_batch,
         "defects": defects,
         "quarantine": quarantine,
         "reconciliation": reconciliation,

@@ -103,6 +103,9 @@ class DefectRates:
     duplicate_wo_event: float = 0.3
     reversed_invoice: float = 0.01
     double_keyed_line: float = 0.002
+    double_payment: float = 0.02  # per received PO: the bank pays it twice
+    late_payment: float = 0.02  # per received PO: paid 5-10 days after receipt
+    missing_files: int = 1  # MES production files that are never delivered
 
 
 def business_date(sim_day: int) -> date:
@@ -471,33 +474,112 @@ class _Exporter:
             self.add("cmms_work_orders", f"cmms_work_orders_{bdate:%Y%m%d}.jsonl", bdate, records)
 
     def build_bank(self) -> None:
-        by_day: dict[int, list[Record]] = defaultdict(list)
+        """Bank statements from the cash ledger, with payment errors injected.
+
+        The bank is the real world: a double or late payment changes the statement (and
+        every running balance after it), not the ERP. Only reconciliation can catch them.
+        """
         maintenance_ref = {f"MX-{e}": f"WO-25-{e:04d}" for e, _, _ in self.truth.maintenance}
         material_of_po = {po: m for po, m, *_ in self.truth.receipts}
+        last_day = self.truth.days
+        events: dict[int, list[dict]] = defaultdict(list)
+        opening = 0.0
         check_no = 10_000
-        for day, kind, amount, balance, ref in self.truth.cash:
+        for day, kind, amount, _, ref in self.truth.cash:
             if kind == "Opening Balance":
-                by_day[1].append(
-                    Record(
-                        {"desc": "BALANCE FORWARD", "amount": None, "balance": balance, "day": 1}
-                    )
-                )
+                opening = amount
                 continue
+            defects: list[dict] = []
             if kind == "Sales Revenue":
                 desc = f"LOCKBOX DEPOSIT {business_date(day):%Y%m%d} CUSTOMER RECEIPTS"
             elif kind == "Material Purchase":
                 po_id = int(ref.split("-")[1])
                 vendor = VENDORS[material_of_po[po_id]]
                 desc = f"ACH DEBIT {vendor.upper()} PO-{po_id:06d}"
+                info = {
+                    "po": f"PO-{po_id:06d}",
+                    "receipt_date": business_date(day),
+                    "amount": -amount,
+                }
+                if day + 12 <= last_day and self.chance(self.rates.late_payment):
+                    delay = int(self.rng.integers(5, 11))
+                    paid = day + delay
+                    events[paid].append(
+                        {
+                            "desc": desc,
+                            "amount": amount,
+                            "defects": [
+                                {"defect": "late_payment", **info, "paid_date": business_date(paid)}
+                            ],
+                        }
+                    )
+                    continue
+                if self.chance(self.rates.double_payment):
+                    events[day].append(
+                        {
+                            "desc": desc,
+                            "amount": amount,
+                            "defects": [{"defect": "double_payment", **info}],
+                        }
+                    )
             else:
                 check_no += 1
                 desc = f"CHECK {check_no} {SERVICE_VENDOR.upper()} {maintenance_ref[ref]}"
-            by_day[day].append(
-                Record({"desc": desc, "amount": amount, "balance": balance, "day": day})
+            events[day].append({"desc": desc, "amount": amount, "defects": defects})
+        balance = opening
+        for day in range(1, last_day + 1):
+            records = []
+            if day == 1:
+                records.append(
+                    Record(
+                        {"desc": "BALANCE FORWARD", "amount": None, "balance": balance, "day": 1}
+                    )
+                )
+            for e in events.get(day, []):
+                balance += e["amount"]
+                records.append(
+                    Record(
+                        {"desc": e["desc"], "amount": e["amount"], "balance": balance, "day": day},
+                        e["defects"],
+                    )
+                )
+            if records:
+                bdate = business_date(day)
+                self.add("bank_statements", f"bank_statement_{bdate:%Y%m%d}.csv", bdate, records)
+
+    def drop_files(self) -> list[dict]:
+        """Never deliver some MES production files.
+
+        Only a day whose records all live in its own file (no corrections or duplicates in
+        neighbouring files) is eligible, so the loss is exactly that day's production.
+        """
+        mes = [f for f in self.files if f.source == "mes_production"]
+        elsewhere = {
+            r.data["business_date"]
+            for f in mes
+            for r in f.records
+            if r.data["business_date"] != f.business_date
+        }
+        eligible = [
+            f
+            for f in mes
+            if f.business_date not in elsewhere
+            and all(r.data["business_date"] == f.business_date for r in f.records)
+        ]
+        dropped = []
+        for i in sorted(
+            self.rng.choice(len(eligible), size=self.rates.missing_files, replace=False)
+        ):
+            f = eligible[int(i)]
+            self.files.remove(f)
+            dropped.append(
+                {
+                    "defect": "missing_file",
+                    "source": f.source,
+                    "business_date": f.business_date.isoformat(),
+                }
             )
-        for day, records in sorted(by_day.items()):
-            bdate = business_date(day)
-            self.add("bank_statements", f"bank_statement_{bdate:%Y%m%d}.csv", bdate, records)
+        return dropped
 
     # ------------------------------------------------------------------ file-level defects
 
@@ -794,9 +876,10 @@ def export_sources(
     exporter.build_snapshots()
     exporter.build_work_orders()
     exporter.build_bank()
+    dropped = exporter.drop_files()
     exporter.apply_file_defects()
 
-    manifest: list[dict] = []
+    manifest: list[dict] = list(dropped)
     written = records = 0
 
     def write(f: SourceFile, payload: bytes, arrival: date) -> str:

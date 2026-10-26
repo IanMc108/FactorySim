@@ -2,7 +2,8 @@
 WITH parsed AS (
     SELECT
         *,
-        CAST(try_strptime(record ->> 'snapshot_date', '%Y-%m-%d') AS DATE) AS snapshot_date,
+        CAST(strict_ts(record ->> 'snapshot_date', '\d{4}-\d{2}-\d{2}', '%Y-%m-%d') AS DATE)
+            AS snapshot_date,
         upper(trim(record ->> 'material')) AS material_raw,
         strict_int(record ->> 'on_hand') AS on_hand,
         upper(trim(record ->> 'uom')) AS uom
@@ -14,7 +15,7 @@ SELECT
         WHEN _parse_error IS NOT NULL THEN 'malformed_record'
         WHEN snapshot_date IS NULL THEN 'invalid_date'
         WHEN on_hand IS NULL OR on_hand < 0 THEN 'invalid_quantity'
-        WHEN uom <> 'EA' THEN 'unsupported_uom'
+        WHEN uom IS DISTINCT FROM 'EA' THEN 'unsupported_uom'
         WHEN m.material_code IS NULL THEN 'unknown_material'
     END AS reject_reason,
     snapshot_date AS business_date,

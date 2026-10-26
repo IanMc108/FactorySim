@@ -4,7 +4,8 @@ WITH parsed AS (
         *,
         NULLIF(trim(record ->> 'gr_number'), '') AS gr_no,
         NULLIF(trim(record ->> 'po_number'), '') AS po_no,
-        CAST(try_strptime(record ->> 'receipt_date', '%Y-%m-%d') AS DATE) AS receipt_date,
+        CAST(strict_ts(record ->> 'receipt_date', '\d{4}-\d{2}-\d{2}', '%Y-%m-%d') AS DATE)
+            AS receipt_date,
         upper(trim(record ->> 'material')) AS material_raw,
         strict_int(record ->> 'quantity') AS qty,
         upper(trim(record ->> 'uom')) AS uom,
@@ -21,7 +22,7 @@ SELECT
         WHEN gr_no IS NULL OR po_no IS NULL THEN 'missing_key'
         WHEN receipt_date IS NULL THEN 'invalid_date'
         WHEN qty IS NULL OR qty <= 0 THEN 'invalid_quantity'
-        WHEN unit_cost IS NULL OR amount IS NULL THEN 'invalid_amount'
+        WHEN unit_cost IS NULL OR amount IS NULL OR unit_cost <= 0 THEN 'invalid_amount'
         WHEN abs(qty * unit_cost - amount) > 0.01 THEN 'amount_mismatch'
         WHEN m.material_code IS NULL THEN 'unknown_material'
         WHEN u.units_per_uom IS NULL THEN 'unknown_uom'

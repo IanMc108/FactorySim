@@ -6,18 +6,26 @@ SHA-256, the arrival and business dates, the file's ingest sequence number and i
 number in the file. Records that cannot be split into the header's columns are kept with a
 ``_parse_error`` (and their raw text) rather than dropped.
 
-A file *version* is a (path, SHA-256) pair:
+Every arrival of a file is an event in the ingest log:
 
-* the same path with the same content again (a re-run) is skipped silently;
-* the same content at a new path (a re-delivery) is logged as ``duplicate_content``;
-* new content at a known path (an in-place overwrite) is loaded as a new version, and
-  silver's latest-wins ordering makes it supersede the old one;
+* a path whose size and modification time match its last log entry is skipped without
+  being read (a re-run), and so is a path whose content hash matches its last entry;
+* content already loaded under the same file name (a re-delivery, or a revert to an
+  earlier version) is logged as ``duplicate_content`` and not stored again;
+* new content is decoded, split into records and written to bronze as ``loaded``;
 * a file that cannot be read (bad name, undecodable bytes) is logged as ``rejected``
   and the rest of the batch carries on. Marker files such as ``_SUCCESS`` are ignored.
 
+Which version of a file name is *current* is decided from the log, not from bronze: the
+loaded or duplicate entry with the latest arrival date (then the latest ingest sequence).
+So a revert, a header-only re-issue that withdraws every record, and a version that lands
+in an earlier arrival folder are all handled the same way in incremental and full runs.
+
 Each file is committed on its own: its bronze Parquet is written to a temporary name and
 renamed, then its ingest-log entry is written the same way. A crash between the two leaves
-an orphan bronze file, which the next run deletes before doing anything else.
+an orphan bronze file, which the next run deletes before doing anything else; a logged
+bronze file that has gone missing is rebuilt from the landing zone. At the end of a batch
+its per-file log entries are compacted into one file.
 """
 
 from __future__ import annotations
@@ -78,6 +86,12 @@ class LandedFile:
     relative: str
     arrival_date: date | None
     business_date: date | None
+    size: int = 0
+    mtime_ns: int = 0
+
+    @property
+    def name(self) -> str:
+        return Path(self.relative).name
 
 
 @dataclass(frozen=True)
@@ -85,7 +99,7 @@ class IngestResult:
     file: LandedFile
     sha256: str
     seq: int
-    status: str  # loaded | duplicate_content | rejected
+    status: str  # loaded | duplicate_content | touched | rejected
     encoding: str
     records: int
     header_repeats: int
@@ -121,7 +135,12 @@ def discover(landing: Path, through: date | None = None) -> list[LandedFile]:
                 continue
             name_match = _FILE_DATE.search(path.name)
             business = _ymd(name_match.group(1)) if name_match else None
-            found.append(LandedFile(source, path, relative, arrival, business))
+            stat = path.stat()
+            found.append(
+                LandedFile(
+                    source, path, relative, arrival, business, stat.st_size, stat.st_mtime_ns
+                )
+            )
     return sorted(found, key=lambda f: (f.arrival_date or date.min, f.source, f.relative))
 
 
@@ -164,7 +183,10 @@ def _parse_csv(text: str) -> tuple[list[tuple], int, int]:
 
 def _parse_jsonl(text: str) -> tuple[list[tuple], int, int]:
     rows, errors = [], 0
-    for number, line in enumerate(text.splitlines(), start=1):
+    # Split on "\n" only: str.splitlines() would also break on U+2028 and friends, which
+    # are legal inside JSON strings.
+    for number, line in enumerate(text.split("\n"), start=1):
+        line = line.removesuffix("\r")
         if not line.strip():
             continue
         try:
@@ -204,32 +226,42 @@ def ingest(
     conn: duckdb.DuckDBPyConnection, lake: Lake, files: list[LandedFile], batch_id: str
 ) -> list[IngestResult]:
     """Load new file versions into bronze, committing each file and its log entry in turn."""
-    lake.remove_orphan_bronze(conn)
+    existing_bronze = lake.remove_orphan_bronze(conn)
     log = lake.ingest_log(conn)
-    # A loaded version whose bronze file has gone missing is treated as never seen, so the
-    # landing file is ingested again rather than silently dropping out of silver.
+
+    def bronze_path(r: dict) -> Path:
+        return lake.bronze_file(r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"])
+
+    # A loaded version whose bronze file has gone missing is treated as never loaded, so
+    # the landing file is read and ingested again.
     lost = {
-        (r["file"], r["sha256"])
+        r["sha256"]
         for r in log
-        if r["status"] == "loaded"
-        and not lake.bronze_file(
-            r["source"], r["arrival_date"], Path(r["file"]).stem, r["sha256"]
-        ).exists()
+        if r["status"] == "loaded" and bronze_path(r) not in existing_bronze
     }
-    loaded_hashes = {
-        r["sha256"] for r in log if r["status"] == "loaded" and (r["file"], r["sha256"]) not in lost
+    loaded = {
+        (r["source"], Path(r["file"]).name, r["sha256"])
+        for r in log
+        if r["status"] == "loaded" and r["sha256"] not in lost
     }
-    seen_versions = {(r["file"], r["sha256"]) for r in log} - lost
+    last_by_path = {r["file"]: r for r in log}  # log is ordered by seq
     next_seq = max((r["seq"] for r in log), default=0) + 1
     results = []
     for f in files:
+        last = last_by_path.get(f.relative)
+        if (
+            last
+            and last["sha256"] not in lost
+            and (last.get("size"), last.get("mtime_ns")) == (f.size, f.mtime_ns)
+        ):
+            continue  # unchanged since it was last seen: not even read
         payload = f.path.read_bytes()
         sha = hashlib.sha256(payload).hexdigest()
-        if (f.relative, sha) in seen_versions:
-            continue  # this exact version was handled by an earlier run
-        seen_versions.add((f.relative, sha))
         seq, next_seq = next_seq, next_seq + 1
-        if sha in loaded_hashes:
+        if last and last["sha256"] == sha and sha not in lost:
+            # Same content, new size/mtime stamp: record it so the next run skips the read.
+            result = IngestResult(f, sha, seq, "touched", "", 0, 0, 0)
+        elif (f.source, f.name, sha) in loaded:
             result = IngestResult(f, sha, seq, "duplicate_content", "", 0, 0, 0)
         elif f.arrival_date is None or f.business_date is None:
             result = IngestResult(
@@ -247,8 +279,11 @@ def ingest(
             else:
                 target = lake.bronze_file(f.source, f.arrival_date, Path(f.relative).stem, sha)
                 atomic_write_table(_bronze_table(f, sha, seq, batch_id, rows), target)
-                loaded_hashes.add(sha)
+                loaded.add((f.source, f.name, sha))
+                lost.discard(sha)
                 result = IngestResult(f, sha, seq, "loaded", encoding, len(rows), repeats, errors)
         lake.write_ingest_log_entry(batch_id, result)
+        last_by_path[f.relative] = {"sha256": sha, "size": f.size, "mtime_ns": f.mtime_ns}
         results.append(result)
+    lake.compact_ingest_log(batch_id)
     return results

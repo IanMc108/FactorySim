@@ -58,11 +58,14 @@ def _etl(landing: Path, lake: Path, through: date | None) -> None:
     print(f"  {'entity':20} {'records':>8} {'rejected':>8} {'deduped':>8} {'rows':>8}")
     for e in s.entities:
         print(f"  {e.entity:20} {e.records:8} {e.rejected:8} {e.duplicates_removed:8} {e.rows:8}")
-    print(f"  {'reconciliation':24} {'rows':>6} {'match':>6} {'expl.':>6} {'open':>6} {'exc.':>6}")
+    print(
+        f"  {'reconciliation':24} {'rows':>6} {'match':>6} {'expl.':>6} {'open':>6} "
+        f"{'review':>6} {'exc.':>6}"
+    )
     for name, r in s.recon.items():
         print(
             f"  {name:24} {r['rows']:6} {r['matched']:6} {r['explained']:6} {r['open']:6} "
-            f"{r['exceptions']:6}"
+            f"{r['needs_review']:6} {r['exceptions']:6}"
         )
 
 

@@ -41,20 +41,44 @@ def _upper_trim(col):
     return F.upper(F.trim(col))
 
 
+def _strict_ts(col, pattern: str, fmt: str):
+    """Parse only strings that match the pattern exactly, as the DuckDB strict_ts macro does."""
+    return F.when(col.rlike(pattern), F.to_timestamp(col, fmt))
+
+
 def _strict_int(col):
     """Plain digits only: "10.5", "1e3" and "1_000" are rejected, never rounded."""
     trimmed = F.trim(col)
     return F.when(trimmed.rlike(r"^-?[0-9]+$"), trimmed.cast("bigint"))
 
 
-def latest_file_versions(bronze: DataFrame) -> DataFrame:
-    """Keep only the latest ingested version of each file name (a re-issue replaces it)."""
-    by_name = Window.partitionBy(F.regexp_extract("_file", r"[^/]+$", 0))
-    return (
-        bronze.withColumn("_latest", F.max("_ingest_seq").over(by_name))
-        .filter(F.col("_ingest_seq") == F.col("_latest"))
-        .drop("_latest")
+def current_versions(ingest_log: DataFrame) -> DataFrame:
+    """(source, file_name, sha256) of each file name's current version, from the ingest log.
+
+    The current version is the loaded or duplicate entry with the latest arrival date, then
+    the latest ingest sequence, exactly as in factorysim/etl/lake.py.
+    """
+    file_name = F.regexp_extract("file", r"[^/]+$", 0)
+    latest = Window.partitionBy("source", file_name).orderBy(
+        F.col("arrival_date").desc(), F.col("seq").desc()
     )
+    return (
+        ingest_log.filter(F.col("status").isin("loaded", "duplicate_content"))
+        .withColumn("_rank", F.row_number().over(latest))
+        .filter("_rank = 1")
+        .select("source", file_name.alias("file_name"), "sha256")
+    )
+
+
+def current_records(bronze: DataFrame, versions: DataFrame) -> DataFrame:
+    """Keep only bronze records that belong to their file name's current version."""
+    keyed = bronze.withColumn("_file_name", F.regexp_extract("_file", r"[^/]+$", 0))
+    match = (
+        (keyed._source == versions.source)
+        & (keyed._file_name == versions.file_name)
+        & (keyed._file_sha256 == versions.sha256)
+    )
+    return keyed.join(F.broadcast(versions), match, "left_semi").drop("_file_name")
 
 
 def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame) -> DataFrame:
@@ -72,16 +96,15 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
         "record",
         F.nullif(F.trim(_field("event_id")), F.lit("")).alias("event_id"),
         _strict_int(F.coalesce(_field("revision"), _field("rev"))).alias("revision"),
-        F.when(
-            _field("event_ts_utc").isNotNull(),
-            F.to_timestamp(_field("event_ts_utc"), "yyyy-MM-dd'T'HH:mm:ss'Z'"),
-        )
-        .otherwise(
-            F.to_utc_timestamp(
-                F.to_timestamp(_field("event_time"), "yyyy-MM-dd HH:mm:ss"), PLANT_TZ
-            )
-        )
-        .alias("event_ts_utc"),
+        _field("event_ts_utc").isNotNull().alias("_is_v2"),
+        _strict_ts(
+            _field("event_ts_utc"),
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+        ).alias("_v2_ts_utc"),
+        _strict_ts(
+            _field("event_time"), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", "yyyy-MM-dd HH:mm:ss"
+        ).alias("_v1_ts_local"),
         _upper_trim(F.coalesce(_field("station_code"), _field("station"))).alias("station_raw"),
         F.when(shift_raw.isin("A", "1"), "A")
         .when(shift_raw.isin("B", "2"), "B")
@@ -94,6 +117,24 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
         F.coalesce(_field("operator_id"), _field("operator")).alias("operator_id"),
         _field("comment").alias("comment"),
     )
+    utc = F.to_utc_timestamp("_v1_ts_local", PLANT_TZ)
+
+    def local(ts):
+        return F.from_utc_timestamp(ts, PLANT_TZ)
+
+    one_hour = F.expr("INTERVAL 1 HOUR")
+    local_problem = (
+        F.when(F.col("_is_v2") | F.col("_v1_ts_local").isNull(), F.lit(None))
+        .when(local(utc) != F.col("_v1_ts_local"), "nonexistent_local_time")
+        .when(
+            (local(utc + one_hour) == F.col("_v1_ts_local"))
+            | (local(utc - one_hour) == F.col("_v1_ts_local")),
+            "ambiguous_local_time",
+        )
+    )
+    parsed = parsed.withColumn(
+        "event_ts_utc", F.when(F.col("_is_v2"), F.col("_v2_ts_utc")).otherwise(utc)
+    ).withColumn("_local_time_problem", local_problem)
     resolved = (
         parsed.join(
             F.broadcast(station_aliases.withColumnRenamed("alias", "station_raw")),
@@ -108,10 +149,11 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
         .when(F.col("event_id").isNull(), "missing_key")
         .when(F.col("revision").isNull(), "invalid_revision")
         .when(F.col("event_ts_utc").isNull(), "invalid_timestamp")
+        .when(F.col("_local_time_problem").isNotNull(), F.col("_local_time_problem"))
         .when(F.col("qty").isNull(), "invalid_quantity")
         .when(F.col("qty") <= 0, "non_positive_quantity")
         .when(F.col("shift").isNull(), "invalid_shift")
-        .when(F.col("uom") != "EA", "unsupported_uom")
+        .when(~F.col("uom").eqNullSafe("EA"), "unsupported_uom")
         .when(F.col("station_code").isNull(), "unknown_station")
         .when(F.col("sku").isNull(), "unknown_sku")
     )
@@ -123,10 +165,10 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
 
 
 def transform(
-    bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame
+    bronze: DataFrame, versions: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame
 ) -> tuple[DataFrame, DataFrame]:
     """Return (silver, quarantine) for MES production events."""
-    validated = parse(latest_file_versions(bronze), station_aliases, sku_aliases)
+    validated = parse(current_records(bronze, versions), station_aliases, sku_aliases)
     latest_first = Window.partitionBy("event_id").orderBy(
         F.col("revision").desc(),
         F.col("_file_business_date").desc(),
@@ -230,7 +272,10 @@ def main() -> None:  # pragma: no cover - runs on AWS Glue only
         stations = spark.read.option("header", True).csv(f"{ref}/station_aliases.csv")
         skus = spark.read.option("header", True).csv(f"{ref}/sku_aliases.csv")
         bronze = spark.read.parquet(f"{lake}/bronze/mes_production/")
-        silver, quarantine = transform(bronze, stations, skus)
+        log = spark.read.option("mergeSchema", True).parquet(
+            f"{lake}/_control/ingest_log/*/*.parquet"
+        )
+        silver, quarantine = transform(bronze, current_versions(log), stations, skus)
         sync_partitions(spark, silver, f"{lake}/silver/production_events")
         sync_partitions(spark, quarantine, f"{lake}/quarantine/mes_production")
     job.commit()
