@@ -25,6 +25,9 @@ from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
 PLANT_TZ = "America/Chicago"
+# The record-date rule of factorysim/etl/pipeline.py.
+RECORD_DAYS_BEFORE_FILE = 60
+RECORD_DAYS_AFTER_FILE = 1
 SPARK_CONF = {
     "spark.sql.session.timeZone": "UTC",
     # Unparseable timestamps become NULL (and are quarantined) instead of failing the job.
@@ -45,7 +48,13 @@ def _trim(col):
 
 
 def _upper_trim(col):
-    return F.upper(_trim(col))
+    # Java upper-cases some characters to several (ß -> SS, the ﬆ ligature -> ST); DuckDB
+    # maps one to one and leaves them as they are. Where Spark's result changes length,
+    # keep the original: like DuckDB's, it then still holds a non-ASCII character and
+    # matches no (upper-case ASCII) alias, so both engines quarantine it.
+    trimmed = _trim(col)
+    upper = F.upper(trimmed)
+    return F.when(F.length(upper) == F.length(trimmed), upper).otherwise(trimmed)
 
 
 def _strict_ts(col, pattern: str, fmt: str):
@@ -60,7 +69,7 @@ def _strict_int(col):
     newline, which would let "10\n" through where DuckDB's full match rejects it.
     """
     trimmed = _trim(col)
-    return F.when(trimmed.rlike(r"\A-?[0-9]+\z"), trimmed.cast("bigint"))
+    return F.when(trimmed.rlike(r"\A-?[0-9]{1,12}\z"), trimmed.cast("bigint"))
 
 
 def current_versions(ingest_log: DataFrame) -> DataFrame:
@@ -173,6 +182,12 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
     business_date = F.when(
         (F.col("shift") == "C") & (F.hour("event_ts_local") < 6), F.date_sub(local_date, 1)
     ).otherwise(local_date)
+    # The same record-date rule as factorysim/etl/pipeline.py (build_silver).
+    implausible = ~business_date.between(
+        F.date_sub("_file_business_date", RECORD_DAYS_BEFORE_FILE),
+        F.date_add("_file_business_date", RECORD_DAYS_AFTER_FILE),
+    )
+    reject = F.coalesce(reject, F.when(implausible, F.lit("implausible_date")))
     return resolved.withColumn("reject_reason", reject).withColumn("business_date", business_date)
 
 
