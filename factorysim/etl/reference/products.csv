@@ -1,0 +1,8 @@
+sku,product_name,product_family,quality_grade,sellable
+MPU-XL-A,Microprocessor Die XL (Grade A),Microprocessor XL,A,true
+MPU-XL-B,Microprocessor Die XL (Grade B),Microprocessor XL,B,true
+MPU-XL-SCRAP,Microprocessor Die XL (Scrap),Microprocessor XL,Scrap,false
+MESH-AIM,Anodized Interconnect Mesh,Mesh,Standard,true
+MESH-SCRAP,Interconnect Mesh (Scrap),Mesh,Scrap,false
+SUB-PE,Patterned Etch Substrate,Etch Substrates,Standard,true
+SUB-SCRAP,Etch Substrate (Scrap),Etch Substrates,Scrap,false

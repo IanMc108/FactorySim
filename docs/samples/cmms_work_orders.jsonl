@@ -1,0 +1,3 @@
+{"work_order": "WO-25-0001", "asset": "LITHO-BAY", "event": "OPENED", "timestamp": "2025-01-30T07:57:37-06:00", "technician": "jm"}
+{"work_order": "WO-25-0001", "asset": "LITHO-BAY", "event": "COMPLETED", "timestamp": "2025-01-30T15:28:48-06:00", "technician": "jm", "cost": {"amount": "5000.00", "currency": "USD"}}
+{"work_order": "WO-25-0001", "asset": "LITHO-BAY", "event": "COMPLETED", "timestamp": "2025-01-30T15:28:48-06:00", "technician": "jm", "cost": {"amount": "5000.00", "currency": "USD"}}

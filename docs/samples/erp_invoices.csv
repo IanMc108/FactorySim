@@ -1,0 +1,5 @@
+document_no,doc_type,reference_doc,document_date,customer_id,line_no,sku,quantity,unit_price,line_amount,currency
+INV-25-000004,INV,,01/02/2025,C1002,1,MPU-XL-A,225,1000.00,"225,000.00",USD
+INV-25-000004,INV,,01/02/2025,C1002,2,mpu-xl-b,49,650,"$31,850.00",USD
+INV-25-000004,INV,,01/02/2025,C1002,3,MESH-AIM,36,400.00,14400.00,USD
+INV-25-000004,INV,,01/02/2025,C1002,4,SUB-PE,170,250,"$42,500.00",USD
