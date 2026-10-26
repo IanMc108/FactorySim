@@ -112,7 +112,11 @@ class RunSummary:
     batch_id: str
     files_loaded: int
     duplicate_files: int
+    # Landed files whose latest log entry is a rejection, reported on every run until the
+    # file is fixed or removed (not only on the run that first saw it).
     rejected_files: list[tuple[str, str | None]]
+    # Current file versions whose bronze and landing file are both gone: data lost.
+    lost_files: list[str]
     watermark: date | None
     entities: list[EntityStats]
     recon: dict[str, dict[str, int]]
@@ -296,13 +300,21 @@ def build_gold(conn, lake: Lake, watermark: date) -> tuple[dict, dict]:
         "CREATE OR REPLACE TEMP VIEW quarantine_facts AS " + _sql("gold", "quarantine_facts.sql")
     )
     lake.file_versions(conn)
-    checks = []
+    checks, names = [], []
     for header, sql in _sections(_sql("gold", "recon_checks.sql"), "check"):
         name, *options = (part.strip() for part in header.split("|"))
+        names.append(name)
         opts = dict(o.split("=", 1) for o in options)
         related = ", ".join(f"'{s.strip()}'" for s in opts["sources"].split(","))
         key = opts["key"]
         key_match = "TRUE" if key == "any" else f"(q.{key} IS NULL OR q.{key} = c.key)"
+        # Evidence is searched from window_start (or the row's date) to the row's date, or
+        # to the column named by evidence_until (a payment window that runs past the date).
+        until = (
+            f"coalesce(c.{opts['evidence_until']}, c.business_date)"
+            if "evidence_until" in opts
+            else "c.business_date"
+        )
         checks.append(
             f"""SELECT '{name}' AS check_name, c.business_date, c.key,
                        CAST(c.expected AS DECIMAL(38, 2)) AS expected,
@@ -319,7 +331,7 @@ def build_gold(conn, lake: Lake, watermark: date) -> tuple[dict, dict]:
                     FROM quarantine_facts q
                     WHERE q._source IN ({related}) AND {key_match} AND NOT q.released
                       AND q.business_date
-                          BETWEEN coalesce(c.window_start, c.business_date) AND c.business_date
+                          BETWEEN coalesce(c.window_start, c.business_date) AND {until}
                 ) e"""
         )
     conn.execute(
@@ -355,14 +367,18 @@ def build_gold(conn, lake: Lake, watermark: date) -> tuple[dict, dict]:
     )
     tables.append("recon_changes")
     conn.execute(
-        """CREATE OR REPLACE TEMP TABLE recon_summary AS
-           SELECT check_name, count(*) AS rows,
+        # Every declared check gets a row, so a check that found nothing reads 0 rather
+        # than looking as if it never ran.
+        f"""CREATE OR REPLACE TEMP TABLE recon_summary AS
+           SELECT check_name, count(r.status) AS rows,
                   count(*) FILTER (WHERE status = 'matched') AS matched,
                   count(*) FILTER (WHERE status = 'open_late_window') AS open,
                   count(*) FILTER (WHERE status = 'exception') AS exceptions,
                   count(*) FILTER (WHERE status = 'exception' AND candidate_records > 0)
                       AS exceptions_with_evidence
-           FROM recon_results GROUP BY check_name ORDER BY check_name"""
+           FROM (VALUES {", ".join(f"('{n}')" for n in names)}) AS c(check_name)
+           LEFT JOIN recon_results r USING (check_name)
+           GROUP BY check_name ORDER BY check_name"""
     )
     tables.append("recon_summary")
     conn.execute(
@@ -400,9 +416,17 @@ def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) ->
             conn.execute(f"SET VARIABLE payment_terms_days = {PAYMENT_TERMS_DAYS}")
             _load_reference(conn)
             batch_id = lake.next_batch_id()
-            results: list[IngestResult] = ingest(conn, lake, discover(landing, through), batch_id)
+            landed = discover(landing, through)
+            results: list[IngestResult] = ingest(conn, lake, landed, batch_id)
             loaded = {r.file.relative for r in results if r.status == "loaded"}
+            last_entry = {r["file"]: r for r in lake.ingest_log(conn)}  # ordered by seq
+            rejected = [
+                (f.relative, last_entry[f.relative]["error"])
+                for f in landed
+                if last_entry.get(f.relative, {}).get("status") == "rejected"
+            ]
             lake.current_versions(conn)
+            lost = lake.lost_versions(conn)
             entities = build_silver(conn, lake)
             watermark = lake.watermark(conn) or date.min
             recon, changes = build_gold(conn, lake, watermark)
@@ -413,7 +437,8 @@ def run_pipeline(landing: Path, lake_root: Path, through: date | None = None) ->
         batch_id=batch_id,
         files_loaded=len(loaded),
         duplicate_files=sum(r.status == "duplicate_content" for r in results),
-        rejected_files=[(r.file.relative, r.error) for r in results if r.status == "rejected"],
+        rejected_files=rejected,
+        lost_files=lost,
         watermark=watermark,
         entities=entities,
         recon=recon,

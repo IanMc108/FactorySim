@@ -312,9 +312,11 @@ def test_lost_control_table_is_rebuilt_from_bronze_and_bronze_is_never_deleted(t
     # A bronze file nobody can account for is set aside for a person, not deleted.
     stray = bronze.parent / "erp_invoices_20250305__000000000000.parquet"
     pq.write_table(pa.table({"x": [1]}), stray)
+    content = stray.read_bytes()
     run(tmp_path)
     assert not stray.exists()
-    assert (tmp_path / "lake/_orphaned" / stray.relative_to(tmp_path / "lake")).exists()
+    moved = tmp_path / "lake/_orphaned" / stray.relative_to(tmp_path / "lake")
+    assert moved.read_bytes() == content
     # A logged bronze file that has gone missing is rebuilt from the landing zone.
     bronze.unlink()
     run(tmp_path)
@@ -1061,10 +1063,12 @@ def test_cli_exit_codes_signal_rejected_files_and_new_exceptions(tmp_path, capsy
     land(tmp_path, *LATE_SNAPSHOT)
     land(tmp_path, "cmms_work_orders", "2025-06-30", "notes.txt", "hello")
     args = ["etl", "--landing", str(tmp_path / "landing"), "--lake", str(tmp_path / "lake")]
-    with pytest.raises(SystemExit) as exit_info:
-        main(args)
-    assert exit_info.value.code == 3
-    assert "REJECTED" in capsys.readouterr().out
+    for _ in range(2):  # a scheduler retry fails again while the file is still there
+        with pytest.raises(SystemExit) as exit_info:
+            main([*args, "--fail-on-new-exceptions"])
+        assert exit_info.value.code == 3
+        assert "REJECTED" in capsys.readouterr().out
+    (tmp_path / "landing/cmms_work_orders/2025/06/30/notes.txt").unlink()
     land(
         tmp_path,
         "erp_invoices",
@@ -1076,6 +1080,9 @@ def test_cli_exit_codes_signal_rejected_files_and_new_exceptions(tmp_path, capsy
         main([*args, "--fail-on-new-exceptions"])
     assert exit_info.value.code == 2
     main([*args, "--fail-on-new-exceptions"])  # nothing new: exits normally
+    with pytest.raises(SystemExit) as exit_info:  # but the exception is still outstanding
+        main([*args, "--fail-on-exceptions"])
+    assert exit_info.value.code == 2
 
 
 def test_overwrite_with_an_older_timestamp_is_the_current_version(tmp_path):
@@ -1133,3 +1140,223 @@ def test_release_needs_a_load_at_least_as_new_on_every_count(tmp_path):
         "SELECT source, sum(records)::INT, sum(released_by_later_load)::INT FROM "
         "read_parquet('@/gold/dq_quarantine_summary/*.parquet') GROUP BY ALL ORDER BY ALL",
     ) == [("erp_invoices", 2, 1), ("mes_production", 1, 0)]
+
+
+# ---------------------------------------------------------------------------- round 4
+
+SNAPSHOT = "snapshot_date,material,on_hand,uom\n"
+
+
+def test_balance_forward_line_that_moves_money_is_unreferenced(tmp_path):
+    land(
+        tmp_path,
+        "bank_statements",
+        "2025-03-04",
+        "bank_statement_20250304.csv",
+        BANK + '03/04/2025,BALANCE FORWARD,,,"1,000,000.00"\r\n'
+        '03/04/2025,BALANCE FORWARD,"250,000.00",,"750,000.00"\r\n',
+        "cp1252",
+    )
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    assert recon(tmp_path, "unreferenced_bank_lines") == [
+        ("bank_statement_20250304.csv#3: BALANCE FORWARD", 0, -250000, "exception")
+    ]
+
+
+def test_unreferenced_bank_credit_is_an_exception(tmp_path):
+    land(
+        tmp_path,
+        "bank_statements",
+        "2025-03-04",
+        "bank_statement_20250304.csv",
+        BANK + '03/04/2025,BALANCE FORWARD,,,"100,000.00"\r\n'
+        '03/04/2025,WIRE IN ACME HOLDINGS,,"10,000.00","110,000.00"\r\n',
+        "cp1252",
+    )
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    assert recon(tmp_path, "unreferenced_bank_lines") == [
+        ("bank_statement_20250304.csv#3: WIRE IN ACME HOLDINGS", 0, 10000, "exception")
+    ]
+
+
+def test_back_valued_bank_line_keeps_statement_order(tmp_path):
+    # A 03/04 debit printed on the 03/05 statement: balances are in statement order.
+    for day, body in (
+        ("2025-03-04", '03/04/2025,BALANCE FORWARD,,,"100,000.00"\r\n'),
+        (
+            "2025-03-05",
+            '03/05/2025,BALANCE FORWARD,,,"100,000.00"\r\n'
+            '03/04/2025,ACH DEBIT MULLER PO-1,"500.00",,"99,500.00"\r\n',
+        ),
+        ("2025-03-06", '03/06/2025,BALANCE FORWARD,,,"99,500.00"\r\n'),
+    ):
+        name = f"bank_statement_{day.replace('-', '')}.csv"
+        land(tmp_path, "bank_statements", day, name, BANK + body, "cp1252")
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    assert {s for *_, s in recon(tmp_path, "bank_balance_continuity")} == {"matched"}
+
+
+def test_misplaced_copy_is_rejected_and_a_stale_resend_is_raised(tmp_path):
+    line = "INV-1,INV,,03/04/2025,C1,1,SUB-PE,{q},250,{a},USD\n"
+    name = "erp_invoices_20250304.csv"
+    original = INVOICES + line.format(q=4, a=1000)
+    land(tmp_path, "erp_invoices", "2025-03-04", name, original)
+    land(tmp_path, *LATE_SNAPSHOT)
+    # A byte-identical copy in a mis-typed folder (2026 for 2025) is rejected like any
+    # other misplaced file: it is neither a duplicate nor the current version, and it does
+    # not move the watermark.
+    land(tmp_path, "erp_invoices", "2026-03-05", name, original)
+    summary = run(tmp_path)
+    assert [f for f, _ in summary.rejected_files] == [f"erp_invoices/2026/03/05/{name}"]
+    assert summary.watermark == date(2025, 6, 30)
+    qty = "SELECT qty FROM read_parquet('@/silver/invoice_lines/*/*.parquet')"
+    land(tmp_path, "erp_invoices", "2025-03-06", name, INVOICES + line.format(q=5, a=1250))
+    run(tmp_path)
+    assert rows(tmp_path, qty) == [(5,)]
+    assert recon(tmp_path, "file_version_revert") == []
+    # A stale re-send of the original after the correction becomes current (latest arrival
+    # wins, as for a deliberate rollback), but it is raised for a person to confirm.
+    land(tmp_path, "erp_invoices", "2025-03-07", name, original)
+    run(tmp_path)
+    assert rows(tmp_path, qty) == [(4,)]
+    assert recon(tmp_path, "file_version_revert") == [(name, 0, 1, "exception")]
+
+
+@pytest.mark.parametrize(("first", "second", "expected"), [(2, 1, "exception"), (1, 2, "matched")])
+def test_shrink_check_follows_the_current_version(tmp_path, first, second, expected):
+    """Overwritten in place by a copy with an older timestamp: the check compares the same
+    two versions that silver uses."""
+    lines = ["2025-03-09,PR-POLY,10,EA\n", "2025-03-09,SI-WFR-300,20,EA\n"]
+    land(tmp_path, *LATE_SNAPSHOT)
+    for n, ts in ((first, 1741600000), (second, 1741500000)):
+        path = land(
+            tmp_path,
+            "erp_stock_snapshots",
+            "2025-03-09",
+            "erp_stock_20250309.csv",
+            SNAPSHOT + "".join(lines[:n]),
+        )
+        os.utime(path, (ts, ts))
+        run(tmp_path)
+    count = "SELECT count(*) FROM read_parquet('@/silver/stock_snapshots/*/*.parquet')"
+    assert rows(tmp_path, count) == [(second + 1,)]  # + the LATE_SNAPSHOT row
+    assert recon(tmp_path, "file_version_shrink") == [
+        ("erp_stock_20250309.csv", max(first, second), second, expected)
+    ]
+
+
+def test_touching_a_rejected_file_keeps_it_rejected(tmp_path):
+    land(tmp_path, *LATE_SNAPSHOT)
+    notes = land(tmp_path, "cmms_work_orders", "2026-12-31", "notes.txt", "hello")
+    run(tmp_path)
+    os.utime(notes, (1800000000, 1800000000))  # chmod, touch or a same-bytes re-upload
+    summary = run(tmp_path)
+    assert summary.watermark == date(2025, 6, 30)
+    assert [f for f, _ in summary.rejected_files] == ["cmms_work_orders/2026/12/31/notes.txt"]
+
+
+def test_arrival_window_boundaries(tmp_path):
+    def snapshot(arrival: str, day: str) -> None:
+        name = f"erp_stock_{day.replace('-', '')}.csv"
+        land(tmp_path, "erp_stock_snapshots", arrival, name, SNAPSHOT + f"{day},PR-POLY,1,EA\n")
+
+    snapshot("2025-04-30", "2025-03-01")  # 60 days late: accepted
+    snapshot("2025-05-02", "2025-03-02")  # 61 days late: rejected
+    snapshot("2025-03-09", "2025-03-10")  # arrived before its business date: rejected
+    summary = run(tmp_path)
+    assert sorted(f for f, _ in summary.rejected_files) == [
+        "erp_stock_snapshots/2025/03/09/erp_stock_20250310.csv",
+        "erp_stock_snapshots/2025/05/02/erp_stock_20250302.csv",
+    ]
+    assert summary.files_loaded == 1
+
+
+def test_empty_jsonl_is_a_day_without_events(tmp_path):
+    land(
+        tmp_path,
+        "cmms_work_orders",
+        "2025-03-04",
+        "cmms_work_orders_20250304.jsonl",
+        '{"work_order":"WO-1","event":"OPENED","timestamp":"2025-03-04T08:00:00-06:00",'
+        '"asset":"LITHO-BAY"}\n'
+        '{"work_order":"WO-1","event":"COMPLETED","timestamp":"2025-03-04T12:00:00-06:00",'
+        '"asset":"LITHO-BAY","cost":{"amount":"5000.00","currency":"USD"}}\n',
+    )
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    # JSON lines have no header, so an empty file is how a quiet day, or a re-issue that
+    # withdraws a day, is delivered. Neither is rejected; the withdrawal is raised.
+    land(tmp_path, "cmms_work_orders", "2025-03-05", "cmms_work_orders_20250305.jsonl", "")
+    land(tmp_path, "cmms_work_orders", "2025-03-06", "cmms_work_orders_20250304.jsonl", "")
+    summary = run(tmp_path)
+    assert summary.rejected_files == [] and summary.files_loaded == 2
+    assert rows(tmp_path, "SELECT * FROM read_parquet('@/gold/fct_maintenance/*.parquet')") == []
+    assert recon(tmp_path, "file_version_shrink") == [
+        ("cmms_work_orders_20250304.jsonl", 2, 0, "exception")
+    ]
+
+
+def test_payment_evidence_covers_the_payment_window(tmp_path):
+    land(
+        tmp_path,
+        "erp_goods_receipts",
+        "2025-03-04",
+        "erp_goods_receipts_20250304.csv",
+        RECEIPTS + "GR-1,PO-1,2025-03-04,PR-POLY,10,EA,100,1000.00\n",
+    )
+    # The payment two days later has an amount in the wrong format, so it is quarantined.
+    land(
+        tmp_path,
+        "bank_statements",
+        "2025-03-06",
+        "bank_statement_20250306.csv",
+        BANK + '03/06/2025,BALANCE FORWARD,,,"100,000.00"\r\n'
+        '03/06/2025,ACH DEBIT MULLER PO-1,"1.000,00",,"99,000.00"\r\n',
+        "cp1252",
+    )
+    land(tmp_path, *LATE_SNAPSHOT)
+    run(tmp_path)
+    assert evidence(tmp_path, "supplier_payments", "PO-1") == ("exception", 1)
+
+
+def test_lost_bronze_without_a_landing_file_is_reported(tmp_path, capsys):
+    from factorysim.cli import main
+
+    path = land(
+        tmp_path,
+        "erp_invoices",
+        "2025-03-04",
+        "erp_invoices_20250304.csv",
+        INVOICES + "INV-1,INV,,03/04/2025,C1,1,SUB-PE,4,250,1000,USD\n",
+    )
+    run(tmp_path)
+    # Bronze lost, and the landing file already expired by an S3 lifecycle rule.
+    next((tmp_path / "lake/bronze/erp_invoices").rglob("*.parquet")).unlink()
+    path.unlink()
+    assert run(tmp_path).lost_files == ["erp_invoices/2025/03/04/erp_invoices_20250304.csv"]
+    with pytest.raises(SystemExit) as exit_info:
+        main(["etl", "--landing", str(tmp_path / "landing"), "--lake", str(tmp_path / "lake")])
+    assert exit_info.value.code == 3
+    assert "LOST erp_invoices/2025/03/04/erp_invoices_20250304.csv" in capsys.readouterr().out
+
+
+def test_crash_during_log_compaction_is_repaired(tmp_path):
+    land(
+        tmp_path,
+        "erp_stock_snapshots",
+        "2025-03-09",
+        "erp_stock_20250309.csv",
+        SNAPSHOT + "2025-03-09,PR-POLY,10,EA\n",
+    )
+    run(tmp_path)
+    # A crash after batch.parquet was written but before the per-file entries it replaced
+    # were removed leaves every entry of the batch on disk twice.
+    batch = next((tmp_path / "lake/_control/ingest_log").glob("batch_id=*"))
+    shutil.copy(batch / "batch.parquet", batch / "00000001.parquet")
+    run(tmp_path)
+    log = "SELECT count(*) FROM read_parquet('@/_control/ingest_log/*/*.parquet')"
+    assert rows(tmp_path, log) == [(1,)]
+    assert recon(tmp_path, "file_version_shrink") == []

@@ -1,5 +1,7 @@
 -- Bank statement lines. Statements have no transaction id, so the running balance is
--- part of the natural key. The first statement opens with a BALANCE FORWARD line.
+-- part of the natural key. The first statement opens with a BALANCE FORWARD line. Only a
+-- BALANCE FORWARD line that moves no money is an opening balance: one that carries a debit
+-- or credit is unclassified, so the unreferenced_bank_lines check raises it.
 WITH parsed AS (
     SELECT
         *,
@@ -31,7 +33,8 @@ SELECT
     txn_date AS business_date,
     txn_date, description,
     CASE
-        WHEN description = 'BALANCE FORWARD' THEN 'opening_balance'
+        WHEN description = 'BALANCE FORWARD' AND debit_text IS NULL AND credit_text IS NULL
+            THEN 'opening_balance'
         WHEN description LIKE 'LOCKBOX DEPOSIT%' THEN 'customer_receipts'
         WHEN regexp_matches(description, 'PO-\d+') THEN 'supplier_payment'
         WHEN regexp_matches(description, 'WO-\d+-\d+') THEN 'maintenance_payment'

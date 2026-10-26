@@ -37,8 +37,15 @@ def _field(name: str):
     return F.get_json_object(F.col("record"), f"$.{name}")
 
 
+def _trim(col):
+    # DuckDB's trim() strips Unicode space separators (category Zs: space, NBSP, em space,
+    # ...) and nothing else, not tabs or newlines; Spark's trim() strips only ASCII spaces.
+    # \A and \z, not ^ and $: Java's $ also matches before a trailing newline.
+    return F.regexp_replace(col, r"\A\p{Zs}+|\p{Zs}+\z", "")
+
+
 def _upper_trim(col):
-    return F.upper(F.trim(col))
+    return F.upper(_trim(col))
 
 
 def _strict_ts(col, pattern: str, fmt: str):
@@ -52,7 +59,7 @@ def _strict_int(col):
     Patterns are anchored with \A and \z: in Java regex "$" also matches before a final
     newline, which would let "10\n" through where DuckDB's full match rejects it.
     """
-    trimmed = F.trim(col)
+    trimmed = _trim(col)
     return F.when(trimmed.rlike(r"\A-?[0-9]+\z"), trimmed.cast("bigint"))
 
 
@@ -99,7 +106,7 @@ def parse(bronze: DataFrame, station_aliases: DataFrame, sku_aliases: DataFrame)
         "_parse_error",
         "_raw",
         "record",
-        F.nullif(F.trim(_field("event_id")), F.lit("")).alias("event_id"),
+        F.nullif(_trim(_field("event_id")), F.lit("")).alias("event_id"),
         _strict_int(F.coalesce(_field("revision"), _field("rev"))).alias("revision"),
         _field("event_ts_utc").isNotNull().alias("_is_v2"),
         _strict_ts(

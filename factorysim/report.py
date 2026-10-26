@@ -442,13 +442,13 @@ def render_etl_block(results: dict, sweep: list[dict]) -> str:
         )
     lines += [
         "",
-        f"Every one of the {r['exceptions']} exceptions is accounted for: "
-        f"{r['business_errors_caught']} rows are injected business errors (caught; "
-        f"{r['business_errors_open']} more were still inside the late-arrival window at the "
-        "end of the year), and the rest are injected lost records, each flagged with the "
-        f"quarantined record attached ({r['data_loss_rows_with_evidence']} of "
-        f"{r['expected_data_loss_rows']} rows touched by a lost record). Exceptions with no "
-        f"injected cause: {len(r['unexpected_exceptions'])}. "
+        f"All {r['exceptions']} exceptions trace back to an injected defect; "
+        f"{len(r['unexpected_exceptions'])} have no injected cause. Injected business errors: "
+        f"{r['business_errors_caught']} rows are exceptions and {r['business_errors_open']} "
+        "more were still inside the late-arrival window at the end of the year. Injected lost "
+        f"records: {r['data_loss_rows_with_evidence']} of the {r['expected_data_loss_rows']} "
+        "rows they touch are raised (as exceptions, or as open if recent) with the lost "
+        "record attached as evidence. "
         f"Business-error rows that also carry quarantine evidence from the same day, where an "
         f"analyst has to look past it: {r['business_errors_with_evidence']}.",
         "",
@@ -489,7 +489,15 @@ def render_etl_block(results: dict, sweep: list[dict]) -> str:
             f"{x['data_loss_rows_flagged_with_evidence']} / {x['data_loss_rows']} | "
             f"{x['unexpected_exceptions']} | {x['unexplained_cells']} |"
         )
-    lines += ["", ETL_END]
+    lines += [
+        "",
+        "Alarms raised then cleared are exceptions that a later batch closes: for example a "
+        "duplicate invoice whose reversing credit memo arrives more than 7 days later (the "
+        "exporter delays credit memos by up to 10 days). Until it arrives, the duplicate is a "
+        "real over-billing, so the alarm is correct; how many occur depends on the seed.",
+        "",
+        ETL_END,
+    ]
     return "\n".join(lines)
 
 
